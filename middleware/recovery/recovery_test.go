@@ -1,11 +1,13 @@
 package recovery_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -33,14 +35,15 @@ import (
 )
 
 const (
-	pathBoom   = "/boom"
-	pathLate   = "/late"
-	pathAbort  = "/abort"
-	pathOK     = "/ok"
-	msgPanic   = "panic recovered"
-	problemCT  = "application/problem+json"
-	plainCT    = "text/plain; charset=utf-8"
-	teapotBody = "short and stout"
+	pathBoom    = "/boom"
+	pathLate    = "/late"
+	pathAbort   = "/abort"
+	pathOK      = "/ok"
+	msgPanic    = "panic recovered"
+	problemCT   = "application/problem+json"
+	plainCT     = "text/plain; charset=utf-8"
+	teapotBody  = "short and stout"
+	bodyPartial = "partial"
 )
 
 var errDomain = errors.New("domain failure")
@@ -115,7 +118,7 @@ func registerRoutes(api huma.API) {
 			return &huma.StreamResponse{Body: func(ctx huma.Context) {
 				ctx.SetHeader("Content-Type", "text/plain")
 				ctx.SetStatus(http.StatusAccepted)
-				_, _ = ctx.BodyWriter().Write([]byte("partial"))
+				_, _ = ctx.BodyWriter().Write([]byte(bodyPartial))
 				panic("after the response started")
 			}}, nil
 		})
@@ -170,7 +173,7 @@ func TestRecoveredResponses(t *testing.T) {
 		},
 		{
 			name: "response already started is left alone", path: pathLate, wantStatus: http.StatusAccepted,
-			wantType: "text/plain", wantInBody: "partial",
+			wantType: "text/plain", wantInBody: bodyPartial,
 		},
 	}
 	for an, mk := range builders() {
@@ -442,10 +445,10 @@ func TestHandlerForm(t *testing.T) {
 			wantStatus: 500, wantBody: "Internal Server Error\n",
 		},
 		{
-			name: "response already started", wantStatus: http.StatusAccepted, wantBody: "partial",
+			name: "response already started", wantStatus: http.StatusAccepted, wantBody: bodyPartial,
 			next: func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusAccepted)
-				_, _ = w.Write([]byte("partial"))
+				_, _ = w.Write([]byte(bodyPartial))
 				panic("late")
 			},
 		},
@@ -548,6 +551,7 @@ func TestHandlerInterimStatusAndHijack(t *testing.T) {
 		next       http.HandlerFunc
 		name       string
 		wantStatus int
+		hijackable bool
 	}{
 		{
 			name: "an early hint does not count as a started response", wantStatus: http.StatusInternalServerError,
@@ -564,10 +568,40 @@ func TestHandlerInterimStatusAndHijack(t *testing.T) {
 			},
 		},
 		{
-			name: "a hijack attempt counts as a started response: no 500 is written over it", wantStatus: 0,
+			name:       "an unsupported hijack leaves the response unstarted and is not advertised",
+			wantStatus: http.StatusInternalServerError,
 			next: func(w http.ResponseWriter, _ *http.Request) {
+				_, ok := w.(http.Hijacker)
+				assert.False(t, ok, "the capability is not advertised when the writer lacks it")
 				_, _, err := http.NewResponseController(w).Hijack()
 				assert.ErrorIs(t, err, http.ErrNotSupported)
+				panic("boom")
+			},
+		},
+		{
+			name: "a hijack starts the response: no 500 is written over it", wantStatus: 0, hijackable: true,
+			next: func(w http.ResponseWriter, _ *http.Request) {
+				h, ok := w.(http.Hijacker)
+				if assert.True(t, ok, "a direct assertion works when the writer is a hijacker") {
+					_, _, err := h.Hijack()
+					assert.NoError(t, err)
+				}
+				panic("boom")
+			},
+		},
+		{
+			name: "a flush starts the response", wantStatus: 0,
+			next: func(w http.ResponseWriter, _ *http.Request) {
+				assert.NoError(t, http.NewResponseController(w).Flush())
+				panic("boom")
+			},
+		},
+		{
+			name: "a plain flusher assertion works too", wantStatus: 0,
+			next: func(w http.ResponseWriter, _ *http.Request) {
+				if f, ok := w.(http.Flusher); assert.True(t, ok) {
+					f.Flush()
+				}
 				panic("boom")
 			},
 		},
@@ -578,7 +612,11 @@ func TestHandlerInterimStatusAndHijack(t *testing.T) {
 			logger, _ := newLogger()
 			h := recovery.Handler(recovery.WithLogger(logger))(tt.next)
 			rec := &statusRecorder{ResponseRecorder: httptest.NewRecorder()}
-			_, p := get2(h, rec)
+			var w http.ResponseWriter = rec
+			if tt.hijackable {
+				w = hijackRecorder{rec}
+			}
+			_, p := get2(h, w)
 			require.Nil(t, p)
 			assert.Equal(t, tt.wantStatus, rec.last)
 		})
@@ -607,3 +645,10 @@ func get2(h http.Handler, w http.ResponseWriter) (http.ResponseWriter, any) {
 
 	return w, panicValue
 }
+
+// hijackRecorder is a response writer that can be hijacked.
+type hijackRecorder struct {
+	*statusRecorder
+}
+
+func (hijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) { return nil, nil, nil }

@@ -37,16 +37,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"runtime"
+	"sync/atomic"
 
 	"github.com/danielgtaylor/huma/v2"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/blackbirdworks/huma-middleware/internal/bodywriter"
 	"github.com/blackbirdworks/huma-middleware/middleware/logging"
 )
 
@@ -162,6 +165,9 @@ func New(api huma.API, opts ...Option) Middleware {
 
 			return
 		}
+		g := &guard{ctxBase: ctx}
+		g.body.W = ctx.BodyWriter()
+		g.body.g = g
 		defer func() {
 			v := recover()
 			if v == nil {
@@ -171,7 +177,7 @@ func New(api huma.API, opts ...Option) Middleware {
 				panic(v)
 			}
 			cfg.report(ctx.Context(), v)
-			if ctx.Status() != 0 {
+			if g.wrote.Load() {
 				return // the response is already on its way, there is nothing left to write
 			}
 			switch {
@@ -190,8 +196,78 @@ func New(api huma.API, opts ...Option) Middleware {
 				_, _ = ctx.BodyWriter().Write([]byte(http.StatusText(http.StatusInternalServerError) + "\n"))
 			}
 		}()
-		next(ctx)
+		next(g)
 	}
+}
+
+// ctxBase lets guard embed the context and still define its own methods.
+type ctxBase huma.Context
+
+// guard is the context given to the rest of the chain: it notes when the
+// response was started, by a final status, a body write or a flush. Looking at
+// the status alone is not enough, as writing a body without setting a status
+// starts a 200 response on most adapters.
+type guard struct {
+	ctxBase
+
+	body  tracker
+	wrote atomic.Bool
+}
+
+// tracker is the body writer of a guard.
+type tracker struct {
+	bodywriter.Passthrough
+
+	g *guard
+}
+
+func (t *tracker) Write(p []byte) (int, error) {
+	t.g.wrote.Store(true)
+
+	return t.W.Write(p) //nolint:wrapcheck // transparent pass-through of the response writer error
+}
+
+// Flush flushes the response and notes that it started.
+func (t *tracker) Flush() { _ = t.FlushError() }
+
+// FlushError flushes the response and notes that it started.
+func (t *tracker) FlushError() error {
+	t.g.wrote.Store(true)
+
+	return t.Passthrough.FlushError()
+}
+
+// SetStatus notes the status; an informational one (103 Early Hints) does not start the final response.
+func (g *guard) SetStatus(code int) {
+	if !interim(code) {
+		g.wrote.Store(true)
+	}
+	g.ctxBase.SetStatus(code)
+}
+
+// BodyWriter returns the tracking body writer.
+func (g *guard) BodyWriter() io.Writer { return &g.body }
+
+// Unwrap returns the context this one wraps, which adapters' Unwrap helpers follow.
+func (g *guard) Unwrap() huma.Context { return g.ctxBase }
+
+// bodyStreamer is implemented by the contexts of adapters that stream the body through a callback.
+type bodyStreamer interface {
+	StreamBody(func(io.Writer))
+}
+
+// StreamBody keeps streaming through a callback working on the adapters that need it.
+func (g *guard) StreamBody(fn func(io.Writer)) {
+	bs, ok := g.ctxBase.(bodyStreamer)
+	if !ok {
+		fn(&g.body)
+
+		return
+	}
+	bs.StreamBody(func(sink io.Writer) {
+		g.body.W = sink
+		fn(&g.body)
+	})
 }
 
 // Handler is the [net/http] form of the middleware, for routes that bypass
@@ -207,6 +283,10 @@ func Handler(opts ...Option) func(http.Handler) http.Handler {
 				return
 			}
 			tw := &trackWriter{ResponseWriter: w}
+			var out http.ResponseWriter = tw
+			if _, ok := w.(http.Hijacker); ok {
+				out = hijackTracker{tw}
+			}
 			defer func() {
 				v := recover()
 				if v == nil {
@@ -224,7 +304,7 @@ func Handler(opts ...Option) func(http.Handler) http.Handler {
 					http.Error(tw, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 				}
 			}()
-			next.ServeHTTP(tw, r)
+			next.ServeHTTP(out, r)
 		})
 	}
 }
@@ -248,8 +328,15 @@ func (w *trackWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
-// Hijack lets handlers take over the connection (upgrades) when the underlying writer allows it.
-func (w *trackWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+// hijackTracker is the writer given to handlers when the underlying writer is an
+// [http.Hijacker], so that a direct w.(http.Hijacker) assertion succeeds exactly
+// when it would have on the underlying writer.
+type hijackTracker struct {
+	*trackWriter
+}
+
+// Hijack lets handlers take over the connection (upgrades).
+func (w hijackTracker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	w.wrote = true
 
 	return http.NewResponseController(w.ResponseWriter).Hijack() //nolint:wrapcheck // the writer's own error
@@ -262,9 +349,14 @@ func (w *trackWriter) Write(p []byte) (int, error) {
 }
 
 // Flush keeps streaming responses working.
-func (w *trackWriter) Flush() {
+func (w *trackWriter) Flush() { _ = w.FlushError() }
+
+// FlushError flushes the response, noting that it started, and returns what the
+// underlying writer reports, for [http.ResponseController].
+func (w *trackWriter) FlushError() error {
 	w.wrote = true
-	_ = http.NewResponseController(w.ResponseWriter).Flush()
+
+	return http.NewResponseController(w.ResponseWriter).Flush() //nolint:wrapcheck // the writer's own error
 }
 
 // Unwrap exposes the underlying writer to [http.ResponseController].
