@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -179,6 +180,9 @@ func TestNew(t *testing.T) {
 		{name: "context logger", run: runContextLogger},
 		{name: "parent values", run: runParentValues},
 		{name: "request source", run: runSource},
+		{name: "stream body hook", run: runStreamBodyHook},
+		{name: "quiet handler", run: runQuietHandler},
+		{name: "request id disabled", run: runRequestIDDisabled},
 		{name: "trace ids", run: runTraceIDs},
 		{name: "adapter unwrap", run: runAdapterUnwrapSeesThroughTheWrapper},
 		{name: "state race", run: runRequestStateIsSafeForConcurrentUse},
@@ -226,7 +230,7 @@ func runContextLogger(t *testing.T) {
 			hl := find(lines, msgHandler)
 			require.NotNil(t, hl)
 			assert.Equal(t, "9", hl["id"])
-			assert.Equal(t, "GET", hl["method"])
+			assert.Equal(t, "GET", hl[attrMethod])
 			assert.Equal(t, routeUser, hl["route"])
 			assert.Equal(t, "get-user", hl["operation_id"])
 			assert.Equal(t, wantReqID, hl["request_id"])
@@ -384,7 +388,7 @@ func runHandler(t *testing.T) {
 	inside := find(lines, "inside")
 	require.NotNil(t, inside)
 	assert.Equal(t, "acme", inside["tenant"])
-	assert.Equal(t, "GET", inside["method"])
+	assert.Equal(t, "GET", inside[attrMethod])
 	assert.Equal(t, wantReqID, inside["request_id"])
 	assert.NotContains(t, inside, "user")
 	after := find(lines, "after")
@@ -408,6 +412,11 @@ func runHandlerGivesBackWhatItsCopyLearned(t *testing.T) {
 	h := logging.Handler(mux, logging.WithLogger(logger))
 	req := multipartRequest(t, "/upload/7")
 	h.ServeHTTP(httptest.NewRecorder(), req)
+	t.Cleanup(func() { // the handler is called directly, so the server that removes the upload files is not there
+		if req.MultipartForm != nil {
+			assert.NoError(t, req.MultipartForm.RemoveAll())
+		}
+	})
 	require.NotNil(t, seen)
 	require.NotNil(t, req.MultipartForm, "the original request holds the form, so the server removes its files")
 	assert.Same(t, seen.MultipartForm, req.MultipartForm)
@@ -485,7 +494,7 @@ func runSource(t *testing.T) {
 			access := find(dest.lines(t), "access")
 			require.NotNil(t, access)
 			assert.Equal(t, "u-1", access["user"])
-			assert.NotContains(t, access, "method", "the access log writes its own request attributes")
+			assert.NotContains(t, access, attrMethod, "the access log writes its own request attributes")
 			assert.Equal(t, tt.enrich && !tt.foreign, access["svc"] == "x")
 			assert.Equal(t, tt.traced, access["trace_id"] == wantTrace)
 			after := find(dest.lines(t), "after")
@@ -493,4 +502,126 @@ func runSource(t *testing.T) {
 			assert.Equal(t, "gen", after["request_id"])
 		})
 	}
+}
+
+// ctxBase lets the test contexts embed a context and override its methods.
+type ctxBase huma.Context
+
+// bodyContext is a context with its own body writer, and the stream callback of adapters like Fiber's when streamed
+// is set.
+type bodyContext struct {
+	ctxBase
+
+	body     io.Writer
+	streamed io.Writer
+}
+
+func (c *bodyContext) BodyWriter() io.Writer { return c.body }
+
+// streamingContext adds the StreamBody hook of adapters that stream through a callback.
+type streamingContext struct {
+	*bodyContext
+}
+
+func (c streamingContext) StreamBody(fn func(io.Writer)) { fn(c.streamed) }
+
+// runStreamBodyHook checks that the callback of adapters that stream through one reaches the adapter, and that the
+// others get their body writer.
+func runStreamBodyHook(t *testing.T) {
+	t.Helper()
+
+	tests := []struct {
+		name      string
+		streaming bool
+	}{
+		{name: "callback adapter", streaming: true},
+		{name: "body writer adapter"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/x", http.NoBody)
+			base := humatest.NewContext(&huma.Operation{OperationID: "x", Path: "/x"}, req, httptest.NewRecorder())
+			body, streamed := &bytes.Buffer{}, &bytes.Buffer{}
+			var hctx huma.Context = &bodyContext{ctxBase: base, body: body}
+			if tt.streaming {
+				hctx = streamingContext{&bodyContext{ctxBase: base, body: body, streamed: streamed}}
+			}
+			logging.New()(hctx, func(c huma.Context) {
+				bs, ok := c.(interface{ StreamBody(func(io.Writer)) })
+				require.True(t, ok, "the wrapper keeps the hook")
+				bs.StreamBody(func(w io.Writer) { _, _ = io.WriteString(w, "chunk") })
+			})
+			if tt.streaming {
+				assert.Equal(t, "chunk", streamed.String())
+				assert.Empty(t, body.String())
+			} else {
+				assert.Equal(t, "chunk", body.String())
+			}
+		})
+	}
+}
+
+// methodGated is a handler that only accepts records once the request attributes are bound to it: the full handler
+// of the request logger has them, the handler of the access log does not.
+type methodGated struct {
+	slog.Handler
+
+	bound bool
+}
+
+func (g *methodGated) Enabled(ctx context.Context, l slog.Level) bool {
+	return g.bound && g.Handler.Enabled(ctx, l)
+}
+
+func (g *methodGated) WithAttrs(attrs []slog.Attr) slog.Handler {
+	for _, a := range attrs {
+		if a.Key == attrMethod {
+			return &methodGated{Handler: g.Handler.WithAttrs(attrs), bound: true}
+		}
+	}
+
+	return &methodGated{Handler: g.Handler.WithAttrs(attrs), bound: g.bound}
+}
+
+func (g *methodGated) WithGroup(name string) slog.Handler {
+	return &methodGated{Handler: g.Handler.WithGroup(name), bound: g.bound}
+}
+
+// runQuietHandler checks that the level of the handler of the access log is decided by the handler it writes to:
+// when an enricher opened a group the request attributes are bound on the full handler only.
+func runQuietHandler(t *testing.T) {
+	t.Helper()
+
+	l, _ := newLogger(slog.LevelDebug)
+	gated := slog.New(&methodGated{Handler: l.Handler()})
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/x", http.NoBody)
+	hctx := humatest.NewContext(&huma.Operation{OperationID: "x", Path: "/x"}, req, httptest.NewRecorder())
+	logging.New(logging.WithLogger(gated), logging.WithEnrichLogs(
+		func(_ huma.Context, lg *slog.Logger) *slog.Logger { return lg.WithGroup("g") }),
+	)(hctx, func(c huma.Context) {
+		src, ok := c.Context().Value(reqlog.Key{}).(reqlog.Source)
+		require.True(t, ok)
+		assert.False(t, src.Handler().Enabled(context.Background(), slog.LevelInfo), "decided by the bare handler")
+		assert.True(t, logging.FromContext(c.Context()).Enabled(context.Background(), slog.LevelInfo))
+	})
+}
+
+// runRequestIDDisabled checks that an ID the access log generates does not reach a request logger that has the
+// request ID attribute switched off.
+func runRequestIDDisabled(t *testing.T) {
+	t.Helper()
+
+	l, buf := newLogger(slog.LevelDebug)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/x", http.NoBody)
+	hctx := humatest.NewContext(&huma.Operation{OperationID: "x", Path: "/x"}, req, httptest.NewRecorder())
+	logging.New(logging.WithLogger(l), logging.WithRequestIDHeader(""))(hctx, func(c huma.Context) {
+		src, ok := c.Context().Value(reqlog.Key{}).(reqlog.Source)
+		require.True(t, ok)
+		src.SetRequestID("gen")
+		logging.FromContext(c.Context()).InfoContext(c.Context(), "after")
+	})
+	after := find(buf.lines(t), "after")
+	require.NotNil(t, after)
+	assert.NotContains(t, after, "request_id")
 }

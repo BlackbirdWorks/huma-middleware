@@ -2,6 +2,7 @@ package logging
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"sync"
 
@@ -90,6 +91,9 @@ func (s *state) AddIDs(rec *slog.Record, buf []slog.Attr) {
 
 // SetRequestID implements [reqlog.Source].
 func (s *state) SetRequestID(id string) {
+	if s.handler.cfg.requestID == "" {
+		return // the request ID attribute is disabled
+	}
 	s.mu.Lock()
 	if s.reqID == "" {
 		s.reqID = id
@@ -113,7 +117,15 @@ type lazyHandler struct {
 	quiet bool
 }
 
-func (h *lazyHandler) Enabled(ctx context.Context, l slog.Level) bool { return h.full.Enabled(ctx, l) }
+// Enabled asks the handler that Handle writes to: the quiet one writes through bare, which has not bound the request
+// attributes, so a handler that decides on them must not decide for it.
+func (h *lazyHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	if h.quiet {
+		return h.bare.Enabled(ctx, l)
+	}
+
+	return h.full.Enabled(ctx, l)
+}
 
 func (h *lazyHandler) Handle(ctx context.Context, r slog.Record) error {
 	inner := h.full
@@ -253,6 +265,23 @@ type wrapper struct {
 }
 
 func (w *wrapper) Context() context.Context { return w.ctx }
+
+// bodyStreamer is implemented by the contexts of adapters that stream the body through a callback (Fiber), which
+// huma's SSE support looks for on the context it is given.
+type bodyStreamer interface {
+	StreamBody(func(io.Writer))
+}
+
+// StreamBody keeps streaming through a callback working on the adapters that need it: the callback goes to the
+// context this one wraps, and to its body writer on the others.
+func (w *wrapper) StreamBody(fn func(io.Writer)) {
+	if bs, ok := w.base.(bodyStreamer); ok {
+		bs.StreamBody(fn)
+
+		return
+	}
+	fn(w.base.BodyWriter())
+}
 
 // Unwrap returns the context this one wraps, which adapters' Unwrap helpers (humago.Unwrap, humachi.Unwrap) follow
 // to reach the request and the writer.

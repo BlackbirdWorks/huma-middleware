@@ -15,6 +15,7 @@ import (
 )
 
 const (
+	attrMethod = "method"
 	msgHandler = "handler"
 	tenantAcme = "acme"
 	hdrTenant  = "X-Tenant"

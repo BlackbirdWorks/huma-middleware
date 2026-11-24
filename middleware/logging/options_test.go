@@ -137,7 +137,7 @@ func runEnrich(t *testing.T) {
 				for k, v := range tt.want {
 					assert.Equal(t, v, line[k], k)
 				}
-				assert.Equal(t, "GET", line["method"], "request attributes stay at the top level")
+				assert.Equal(t, "GET", line[attrMethod], "request attributes stay at the top level")
 			})
 		}
 	}
@@ -153,7 +153,7 @@ func runEnrichGroup(t *testing.T) {
 	serve(h, "/users/1")
 	line := find(buf.lines(t), msgHandler)
 	require.NotNil(t, line)
-	assert.Equal(t, "GET", line["method"], "request attributes stay at the top level")
+	assert.Equal(t, "GET", line[attrMethod], "request attributes stay at the top level")
 	grp, ok := line["g"].(map[string]any)
 	require.True(t, ok)
 	assert.Equal(t, "v", grp["k"])
@@ -198,7 +198,7 @@ func runEnrichedLoggers(t *testing.T) {
 			lines := dest.lines(t)
 			handler := find(lines, msgHandler)
 			require.NotNil(t, handler)
-			assert.Equal(t, "GET", handler["method"])
+			assert.Equal(t, "GET", handler[attrMethod])
 		})
 	}
 }
@@ -295,14 +295,14 @@ func TestWithoutRequestAttrs(t *testing.T) {
 			opts: []logging.Option{logging.WithoutRequestAttrs()},
 			check: func(t *testing.T, lines []map[string]any) {
 				t.Helper()
-				assert.NotContains(t, find(lines, msgHandler), "method")
+				assert.NotContains(t, find(lines, msgHandler), attrMethod)
 			},
 		},
 		{
 			name: "default has them",
 			check: func(t *testing.T, lines []map[string]any) {
 				t.Helper()
-				assert.Contains(t, find(lines, msgHandler), "method")
+				assert.Contains(t, find(lines, msgHandler), attrMethod)
 			},
 		},
 	}
@@ -357,7 +357,7 @@ func TestDefaultFields(t *testing.T) {
 		name string
 		want string
 	}{
-		{name: "method", got: func(f logging.Fields) string { return f.Method }, want: "method"},
+		{name: attrMethod, got: func(f logging.Fields) string { return f.Method }, want: attrMethod},
 		{name: "route", got: func(f logging.Fields) string { return f.Route }, want: "route"},
 		{name: "operation", got: func(f logging.Fields) string { return f.OperationID }, want: "operation_id"},
 		{name: "request id", got: func(f logging.Fields) string { return f.RequestID }, want: "request_id"},
