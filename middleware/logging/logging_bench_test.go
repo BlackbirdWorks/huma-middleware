@@ -58,17 +58,7 @@ func runBench(b *testing.B, h http.Handler) {
 
 func BenchmarkBare(b *testing.B) { runBench(b, benchHandler()) }
 
-func BenchmarkLoggingAccessLogInfo(b *testing.B) {
+func BenchmarkLoggingRequestState(b *testing.B) {
 	l := slog.New(slog.NewJSONHandler(sink{}, nil))
 	runBench(b, benchHandler(logging.New(logging.WithLogger(l))))
-}
-
-func BenchmarkLoggingLevelDisabled(b *testing.B) {
-	l := slog.New(slog.NewJSONHandler(sink{}, &slog.HandlerOptions{Level: slog.LevelError}))
-	runBench(b, benchHandler(logging.New(logging.WithLogger(l))))
-}
-
-func BenchmarkLoggingContextOnly(b *testing.B) {
-	l := slog.New(slog.NewJSONHandler(sink{}, nil))
-	runBench(b, benchHandler(logging.New(logging.WithLogger(l), logging.WithoutAccessLog())))
 }

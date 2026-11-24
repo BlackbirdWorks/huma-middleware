@@ -47,12 +47,10 @@ func ExampleNew() {
 	mux.ServeHTTP(httptest.NewRecorder(), req)
 	// Output:
 	// level=INFO msg="loading user" req=abc method=GET route=/users
-	// level=INFO msg=request req=abc path=/users status=204 method=GET route=/users
 }
 
 // ExampleWithEnrichLogs adds a request ID taken from a header and a user ID
-// taken from the context to every log record of the request, including the
-// access log.
+// taken from the context to every log record of the request.
 func ExampleWithEnrichLogs() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{ReplaceAttr: dropNoise}))
 
@@ -83,28 +81,4 @@ func ExampleWithEnrichLogs() {
 	mux.ServeHTTP(httptest.NewRecorder(), req)
 	// Output:
 	// level=INFO msg="loading user" req=abc user=u-7 method=GET route=/users/{id}
-	// level=INFO msg=request req=abc user=u-7 path=/users/7 status=204 method=GET route=/users/{id}
-}
-
-// ExampleWithAccessLogFunc keeps an established access log format.
-func ExampleWithAccessLogFunc() {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{ReplaceAttr: dropNoise}))
-
-	mux := http.NewServeMux()
-	api := humago.New(mux, huma.DefaultConfig("example", "1.0.0"))
-	api.UseMiddleware(logging.New(
-		logging.WithLogger(logger),
-		logging.WithAccessLogFunc(func(ctx context.Context, l *slog.Logger, r logging.Record) {
-			l.LogAttrs(ctx, slog.LevelInfo, "Success",
-				slog.String("request", r.Method+" "+r.RequestURI()),
-				slog.Int("status", r.Status),
-				slog.Int64("size", r.Size),
-			)
-		}),
-	))
-	huma.Get(api, "/ping", func(context.Context, *struct{}) (*struct{}, error) { return &struct{}{}, nil })
-
-	mux.ServeHTTP(httptest.NewRecorder(),
-		httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/ping?a=1", http.NoBody))
-	// Output: level=INFO msg=Success request="GET /ping?a=1" status=204 size=0
 }
