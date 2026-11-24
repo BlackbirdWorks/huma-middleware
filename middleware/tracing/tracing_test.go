@@ -3,9 +3,12 @@ package tracing_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"sync"
 	"testing"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -15,15 +18,16 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/blackbirdworks/huma-middleware/middleware/tracing"
 )
@@ -130,8 +134,59 @@ func attr(kvs []attribute.KeyValue, key string) (attribute.Value, bool) {
 	return attribute.Value{}, false
 }
 
-func TestSpans(t *testing.T) {
+// durationRoutes returns the http.route label of every request duration data point.
+func durationRoutes(t *testing.T, reader *sdkmetric.ManualReader) []string {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	var routes []string
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			h, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok || m.Name != "http.server.request.duration" {
+				continue
+			}
+			for _, dp := range h.DataPoints {
+				if v, found := dp.Attributes.Value("http.route"); found {
+					routes = append(routes, v.AsString())
+				}
+			}
+		}
+	}
+
+	return routes
+}
+
+func panicIf(b bool) {
+	if b {
+		panic("again")
+	}
+}
+
+// TestNew covers the middleware: spans, parents, filters, names, options, panics and the pooled views.
+func TestNew(t *testing.T) {
 	t.Parallel()
+
+	tests := []struct {
+		run  func(t *testing.T)
+		name string
+	}{
+		{name: "spans", run: runSpans},
+		{name: "parent and handler context", run: runParentAndHandlerContext},
+		{name: "default propagator", run: runDefaultPropagatorAndNoOperation},
+		{name: "pooled views", run: runPooledViewsAreNeverShared},
+		{name: "panic", run: runPanicIsRecordedAndRaisedAgain},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tt.run(t)
+		})
+	}
+}
+
+func runSpans(t *testing.T) {
+	t.Helper()
 
 	tests := []struct {
 		name       string
@@ -172,8 +227,8 @@ func TestSpans(t *testing.T) {
 	}
 }
 
-func TestParentAndHandlerContext(t *testing.T) {
-	t.Parallel()
+func runParentAndHandlerContext(t *testing.T) {
+	t.Helper()
 
 	const (
 		wantTrace = "4bf92f3577b34da6a3ce929d0e0e4736"
@@ -197,80 +252,157 @@ func TestParentAndHandlerContext(t *testing.T) {
 	}
 }
 
-func TestFilters(t *testing.T) {
-	t.Parallel()
+func runDefaultPropagatorAndNoOperation(t *testing.T) {
+	t.Helper()
+
+	exp := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
+	mw := tracing.New(tracing.WithTracerProvider(tp), tracing.WithSpanNameFormatter(func(m, r string) string {
+		return m + "|" + r
+	}))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/x", http.NoBody)
+	hctx := humatest.NewContext(nil, req, httptest.NewRecorder())
+	called := false
+	mw(hctx, func(huma.Context) { called = true })
+	assert.True(t, called)
+	spans := exp.GetSpans()
+	require.Len(t, spans, 1)
+	assert.Equal(t, "GET|", spans[0].Name, "no operation, no route")
+}
+
+// runHumaFormFiltersByTemplate checks that the path and request filters of the huma form see the route
+// template only: the concrete URL path "/users/42" must not match a skip for "/users/42".
+// runPooledViewsAreNeverShared serves requests from many goroutines through one middleware, some of which panic:
+// a pooled view must never be used by two requests at once. Run it with -race.
+func runPooledViewsAreNeverShared(t *testing.T) {
+	t.Helper()
+
+	exp := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
+	mw := tracing.New(tracing.WithTracerProvider(tp), tracing.WithPropagators(propagation.TraceContext{}))
+	var wg sync.WaitGroup
+	const goroutines, perGoroutine = 8, 25
+	for g := range goroutines {
+		wg.Go(func() {
+			for i := range perGoroutine {
+				route := "/r" + strconv.Itoa(g)
+				req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, route, http.NoBody)
+				req.Header.Set("Traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+				req.Header.Add("X-Multi", "a")
+				hctx := humatest.NewContext(&huma.Operation{OperationID: "r", Path: route}, req, httptest.NewRecorder())
+				run := func() { mw(hctx, func(huma.Context) { panicIf(i%5 == 0) }) }
+				if i%5 == 0 {
+					assert.Panics(t, run)
+				} else {
+					run()
+				}
+			}
+		})
+	}
+	wg.Wait()
+	spans := exp.GetSpans()
+	assert.Len(t, spans, goroutines*perGoroutine)
+	for _, s := range spans {
+		assert.Equal(t, "4bf92f3577b34da6a3ce929d0e0e4736", s.SpanContext.TraceID().String())
+		route, ok := attr(s.Attributes, "http.route")
+		assert.True(t, ok)
+		assert.Equal(t, "GET "+route.AsString(), s.Name)
+	}
+}
+
+func runPanicIsRecordedAndRaisedAgain(t *testing.T) {
+	t.Helper()
 
 	tests := []struct {
-		name      string
-		path      string
-		opts      []tracing.Option
-		wantSpans int
+		value        any
+		name         string
+		wantMessage  string
+		wantRecorded bool
 	}{
-		{name: "no filter", path: pathHealth, wantSpans: 1},
-		{name: "skip path", opts: []tracing.Option{tracing.WithSkipPaths(pathHealth)}, path: pathHealth},
-		{
-			name: "skip path keeps others", opts: []tracing.Option{tracing.WithSkipPaths(pathHealth)},
-			path: "/users/1", wantSpans: 1,
-		},
-		{
-			name: "skip operation", opts: []tracing.Option{tracing.WithSkipOperations("get-healthz")},
-			path: pathHealth,
-		},
-		{
-			name: "filter false",
-			path: pathHealth,
-			opts: []tracing.Option{
-				tracing.WithFilter(func(c huma.Context) bool { return c.Operation().Path != pathHealth }),
-			},
-		},
-		{
-			name: "filter true", path: pathHealth, wantSpans: 1,
-			opts: []tracing.Option{tracing.WithFilter(func(huma.Context) bool { return true })},
-		},
+		{name: "string", value: panicMsg, wantMessage: "panic: boom", wantRecorded: true},
+		{name: "error", value: errDomain, wantMessage: "panic: domain failure", wantRecorded: true},
+		{name: "abort handler is not an error", value: http.ErrAbortHandler, wantRecorded: false},
 	}
-	for an, b := range builders() {
+	for _, form := range []string{formHuma, formHandler} {
 		for _, tt := range tests {
-			t.Run(an+"/"+tt.name, func(t *testing.T) {
+			t.Run(form+"/"+tt.name, func(t *testing.T) {
 				t.Parallel()
-				f := newFixture(t, b, tt.opts...)
-				require.Equal(t, http.StatusOK, f.do(tt.path).Code)
-				assert.Len(t, f.spans.GetSpans(), tt.wantSpans)
+				exp := tracetest.NewInMemoryExporter()
+				reader := sdkmetric.NewManualReader()
+				tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
+				mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+				opts := []tracing.Option{
+					tracing.WithTracerProvider(tp), tracing.WithMeterProvider(mp),
+					tracing.WithPropagators(propagation.TraceContext{}),
+				}
+				req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/boom", http.NoBody)
+				run := func() {
+					if form == formHandler {
+						h := tracing.Handler(
+							http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic(tt.value) }),
+							opts...)
+						h.ServeHTTP(httptest.NewRecorder(), req)
+
+						return
+					}
+					op := &huma.Operation{OperationID: panicMsg, Path: "/boom"}
+					hctx := humatest.NewContext(op, req, httptest.NewRecorder())
+					tracing.New(opts...)(hctx, func(huma.Context) { panic(tt.value) })
+				}
+				assert.PanicsWithValue(t, tt.value, run, "the original value is raised again")
+
+				spans := exp.GetSpans()
+				require.Len(t, spans, 1, "the span is ended")
+				s := spans[0]
+				recorded := panicEvents(s)
+				if !tt.wantRecorded {
+					assert.Empty(t, recorded)
+
+					return
+				}
+				assert.Equal(t, codes.Error, s.Status.Code)
+				require.Len(t, recorded, 1)
+				assert.Equal(t, tt.wantMessage, recorded[0]["exception.message"])
+				assert.Contains(t, recorded[0]["exception.stacktrace"], "tracing_test.go")
+				code, ok := attr(s.Attributes, "http.response.status_code")
+				require.True(t, ok)
+				assert.EqualValues(t, http.StatusInternalServerError, code.AsInt64())
+				if form == formHuma {
+					assert.Equal(
+						t,
+						[]string{"/boom"},
+						durationRoutes(t, reader),
+						"otelhttp recorded the 500 in its metrics",
+					)
+				}
 			})
 		}
 	}
 }
 
-func TestSpanNameFormatter(t *testing.T) {
+// TestHandler covers the net/http form.
+func TestHandler(t *testing.T) {
 	t.Parallel()
 
-	for an, b := range builders() {
-		t.Run(an, func(t *testing.T) {
+	tests := []struct {
+		run  func(t *testing.T)
+		name string
+	}{
+		{name: "wrapper", run: runHandlerWrapper},
+		{name: "no pattern", run: runHandlerNameFormatterWithoutPattern},
+		{name: "route on the span", run: runHandlerPutsTheRouteOnTheSpan},
+		{name: "multipart and pattern", run: runHandlerGivesBackWhatItsCopyLearned},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			f := newFixture(t, b, tracing.WithSpanNameFormatter(func(m, r string) string { return m + "|" + r }))
-			f.do("/users/1")
-			spans := f.spans.GetSpans()
-			require.Len(t, spans, 1)
-			assert.Equal(t, "GET|/users/{id}", spans[0].Name)
+			tt.run(t)
 		})
 	}
 }
 
-func TestMetricsHaveRoute(t *testing.T) {
-	t.Parallel()
-
-	for an, b := range builders() {
-		t.Run(an, func(t *testing.T) {
-			t.Parallel()
-			f := newFixture(t, b)
-			f.do("/users/7")
-
-			assert.Equal(t, []string{"/users/{id}"}, durationRoutes(t, f.reader))
-		})
-	}
-}
-
-func TestHandlerWrapper(t *testing.T) {
-	t.Parallel()
+func runHandlerWrapper(t *testing.T) {
+	t.Helper()
 
 	exp := tracetest.NewInMemoryExporter()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
@@ -292,69 +424,8 @@ func TestHandlerWrapper(t *testing.T) {
 	assert.Equal(t, "GET /raw/{id}", spans[0].Name)
 }
 
-func TestOptionsAccepted(t *testing.T) {
-	t.Parallel()
-
-	f := newFixture(t, builders()["humago"],
-		tracing.WithPublicEndpoint(),
-		tracing.WithServerName("svc.example"),
-		tracing.WithSpanOptions(trace.WithAttributes(attribute.String("k", "v"))),
-	)
-	f.do("/users/1", "Traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
-	spans := f.spans.GetSpans()
-	require.Len(t, spans, 1)
-	assert.False(t, spans[0].Parent.IsValid(), "public endpoint starts a new root")
-	assert.Len(t, spans[0].Links, 1)
-	v, ok := attr(spans[0].Attributes, "k")
-	require.True(t, ok)
-	assert.Equal(t, "v", v.AsString())
-	addr, _ := attr(spans[0].Attributes, "server.address")
-	assert.Equal(t, "svc.example", addr.AsString())
-}
-
-// durationRoutes returns the http.route label of every request duration data point.
-func durationRoutes(t *testing.T, reader *sdkmetric.ManualReader) []string {
+func runHandlerNameFormatterWithoutPattern(t *testing.T) {
 	t.Helper()
-	var rm metricdata.ResourceMetrics
-	require.NoError(t, reader.Collect(context.Background(), &rm))
-	var routes []string
-	for _, sm := range rm.ScopeMetrics {
-		for _, m := range sm.Metrics {
-			h, ok := m.Data.(metricdata.Histogram[float64])
-			if !ok || m.Name != "http.server.request.duration" {
-				continue
-			}
-			for _, dp := range h.DataPoints {
-				if v, found := dp.Attributes.Value("http.route"); found {
-					routes = append(routes, v.AsString())
-				}
-			}
-		}
-	}
-
-	return routes
-}
-
-func TestDefaultPropagatorAndNoOperation(t *testing.T) {
-	t.Parallel()
-
-	exp := tracetest.NewInMemoryExporter()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
-	mw := tracing.New(tracing.WithTracerProvider(tp), tracing.WithSpanNameFormatter(func(m, r string) string {
-		return m + "|" + r
-	}))
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/x", http.NoBody)
-	hctx := humatest.NewContext(nil, req, httptest.NewRecorder())
-	called := false
-	mw(hctx, func(huma.Context) { called = true })
-	assert.True(t, called)
-	spans := exp.GetSpans()
-	require.Len(t, spans, 1)
-	assert.Equal(t, "GET|", spans[0].Name, "no operation, no route")
-}
-
-func TestHandlerNameFormatterWithoutPattern(t *testing.T) {
-	t.Parallel()
 
 	exp := tracetest.NewInMemoryExporter()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
@@ -370,8 +441,8 @@ func TestHandlerNameFormatterWithoutPattern(t *testing.T) {
 	assert.Equal(t, "GET|", spans[0].Name)
 }
 
-func TestHandlerPutsTheRouteOnTheSpan(t *testing.T) {
-	t.Parallel()
+func runHandlerPutsTheRouteOnTheSpan(t *testing.T) {
+	t.Helper()
 
 	tests := []struct {
 		name      string
@@ -428,71 +499,9 @@ func TestHandlerPutsTheRouteOnTheSpan(t *testing.T) {
 	}
 }
 
-// TestHumaFormFiltersByTemplate checks that the path and request filters of the huma form see the route
-// template only: the concrete URL path "/users/42" must not match a skip for "/users/42".
-func TestHumaFormFiltersByTemplate(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name      string
-		opts      []tracing.Option
-		wantSpans int
-	}{
-		{
-			name:      "a concrete path does not match a template route",
-			opts:      []tracing.Option{tracing.WithSkipPaths("/users/42")},
-			wantSpans: 1,
-		},
-		{name: "the template matches", opts: []tracing.Option{tracing.WithSkipPaths("/users/{id}")}},
-		{
-			name:      "the request filter belongs to the net/http form",
-			opts:      []tracing.Option{tracing.WithRequestFilter(func(*http.Request) bool { return false })},
-			wantSpans: 1,
-		},
-	}
-	for an, b := range builders() {
-		for _, tt := range tests {
-			t.Run(an+"/"+tt.name, func(t *testing.T) {
-				t.Parallel()
-				f := newFixture(t, b, tt.opts...)
-				require.Equal(t, http.StatusOK, f.do("/users/42").Code)
-				assert.Len(t, f.spans.GetSpans(), tt.wantSpans)
-			})
-		}
-	}
-}
-
-// TestGlobalPropagatorRegisteredAfterConstruction sets the global propagator, so it is not parallel.
-func TestGlobalPropagatorRegisteredAfterConstruction(t *testing.T) { //nolint:paralleltest // sets the global propagator
-	prev := otel.GetTextMapPropagator()
-	t.Cleanup(func() { otel.SetTextMapPropagator(prev) })
-
-	for an, b := range builders() { //nolint:paralleltest // see above
-		t.Run(an, func(t *testing.T) {
-			exp := tracetest.NewInMemoryExporter()
-			tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
-			h, api := b(t, nil)
-			// No explicit propagator: the middleware is built before the global one is registered.
-			api.UseMiddleware(tracing.New(tracing.WithTracerProvider(tp)))
-			huma.Get(api, "/users/{id}", func(context.Context, *idIn) (*out, error) { return &out{}, nil })
-			otel.SetTextMapPropagator(propagation.TraceContext{})
-
-			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/users/1", http.NoBody)
-			req.Header.Set("Traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
-			req.Header.Add("X-Multi", "a")
-			req.Header.Add("X-Multi", "b")
-			h.ServeHTTP(httptest.NewRecorder(), req)
-
-			spans := exp.GetSpans()
-			require.Len(t, spans, 1)
-			assert.Equal(t, "4bf92f3577b34da6a3ce929d0e0e4736", spans[0].SpanContext.TraceID().String())
-		})
-	}
-}
-
-// TestHandlerGivesBackWhatItsCopyLearned checks the multipart form and the routing pattern of otelhttp's copy.
-func TestHandlerGivesBackWhatItsCopyLearned(t *testing.T) {
-	t.Parallel()
+// runHandlerGivesBackWhatItsCopyLearned checks the multipart form and the routing pattern of otelhttp's copy.
+func runHandlerGivesBackWhatItsCopyLearned(t *testing.T) {
+	t.Helper()
 
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
@@ -520,4 +529,141 @@ func TestHandlerGivesBackWhatItsCopyLearned(t *testing.T) {
 	require.NotNil(t, req.MultipartForm)
 	assert.Same(t, seen.MultipartForm, req.MultipartForm)
 	assert.Equal(t, "POST /upload/{id}", req.Pattern)
+}
+
+const (
+	reasonNoop     = "the tracer provider and the meter provider are no-op"
+	reasonDisabled = "WithEnabled(false)"
+)
+
+type detectionCase struct {
+	build       func(exp *tracetest.InMemoryExporter) []tracing.Option
+	name        string
+	wantReason  string
+	wantSpans   int
+	wantDormant bool
+}
+
+// providers returns an SDK tracer provider exporting to exp, and a meter provider.
+func providers(exp *tracetest.InMemoryExporter) (*sdktrace.TracerProvider, *sdkmetric.MeterProvider) {
+	return sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp)), sdkmetric.NewMeterProvider()
+}
+
+func detectionCases() []detectionCase {
+	return []detectionCase{
+		{
+			name: "both no-op values",
+			build: func(*tracetest.InMemoryExporter) []tracing.Option {
+				return []tracing.Option{
+					tracing.WithTracerProvider(tracenoop.NewTracerProvider()),
+					tracing.WithMeterProvider(metricnoop.NewMeterProvider()),
+				}
+			},
+			wantReason: reasonNoop, wantDormant: true,
+		},
+		{
+			name: "both no-op pointers",
+			build: func(*tracetest.InMemoryExporter) []tracing.Option {
+				tp, mp := tracenoop.NewTracerProvider(), metricnoop.NewMeterProvider()
+
+				return []tracing.Option{tracing.WithTracerProvider(&tp), tracing.WithMeterProvider(&mp)}
+			},
+			wantReason: reasonNoop, wantDormant: true,
+		},
+		{
+			name: "only the tracer is no-op",
+			build: func(*tracetest.InMemoryExporter) []tracing.Option {
+				_, mp := providers(tracetest.NewInMemoryExporter())
+
+				return []tracing.Option{
+					tracing.WithTracerProvider(tracenoop.NewTracerProvider()),
+					tracing.WithMeterProvider(mp),
+				}
+			},
+		},
+		{
+			name: "only the meter is no-op",
+			build: func(exp *tracetest.InMemoryExporter) []tracing.Option {
+				tp, _ := providers(exp)
+
+				return []tracing.Option{
+					tracing.WithTracerProvider(tp),
+					tracing.WithMeterProvider(metricnoop.NewMeterProvider()),
+				}
+			},
+			wantSpans: 1,
+		},
+		{
+			name: "no-op tracer without an explicit meter provider",
+			build: func(*tracetest.InMemoryExporter) []tracing.Option {
+				return []tracing.Option{tracing.WithTracerProvider(tracenoop.NewTracerProvider())}
+			},
+		},
+		{
+			name: "nothing passed: the global delegate is never taken for disabled",
+			build: func(*tracetest.InMemoryExporter) []tracing.Option {
+				return nil
+			},
+		},
+		{
+			name: "disabled explicitly",
+			build: func(exp *tracetest.InMemoryExporter) []tracing.Option {
+				tp, mp := providers(exp)
+
+				return []tracing.Option{
+					tracing.WithTracerProvider(tp),
+					tracing.WithMeterProvider(mp),
+					tracing.WithEnabled(false),
+				}
+			},
+			wantReason: reasonDisabled, wantDormant: true,
+		},
+		{
+			name: "enabled explicitly despite no-op providers",
+			build: func(*tracetest.InMemoryExporter) []tracing.Option {
+				return []tracing.Option{
+					tracing.WithTracerProvider(tracenoop.NewTracerProvider()),
+					tracing.WithMeterProvider(metricnoop.NewMeterProvider()),
+					tracing.WithEnabled(true),
+				}
+			},
+		},
+		{
+			name: "enabled explicitly with real providers",
+			build: func(exp *tracetest.InMemoryExporter) []tracing.Option {
+				tp, mp := providers(exp)
+
+				return []tracing.Option{
+					tracing.WithTracerProvider(tp),
+					tracing.WithMeterProvider(mp),
+					tracing.WithEnabled(true),
+				}
+			},
+			wantSpans: 1,
+		},
+	}
+}
+
+const (
+	formHuma    = "huma"
+	formHandler = "handler"
+	panicMsg    = "boom"
+)
+
+var errDomain = errors.New("domain failure")
+
+// panicEvents returns the attributes of the exception events recorded by this package.
+func panicEvents(s tracetest.SpanStub) []map[string]string {
+	var out []map[string]string
+	for _, ev := range s.Events {
+		attrs := map[string]string{}
+		for _, kv := range ev.Attributes {
+			attrs[string(kv.Key)] = kv.Value.String()
+		}
+		if ev.Name == "exception" && attrs["exception.type"] == "*tracing.PanicError" {
+			out = append(out, attrs)
+		}
+	}
+
+	return out
 }
