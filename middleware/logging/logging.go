@@ -37,8 +37,10 @@
 package logging
 
 import (
+	"bufio"
 	"context"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
@@ -116,7 +118,7 @@ func New(opts ...Option) Middleware {
 		st.idHeader = cfg.requestID
 		for _, fn := range cfg.enrich {
 			if l := fn(hctx, st.logger); l != nil {
-				st.logger = l
+				st.logger = st.adopt(cfg, l)
 			}
 		}
 		ctx := context.WithValue(hctx.Context(), stateKey{}, st)
@@ -144,6 +146,12 @@ func New(opts ...Option) Middleware {
 			hctx:        hctx,
 		})
 	}
+}
+
+// interim reports whether the status is informational (103 Early Hints): not the final one.
+// 101 Switching Protocols ends the exchange and is final.
+func interim(code int) bool {
+	return code >= http.StatusContinue && code < http.StatusOK && code != http.StatusSwitchingProtocols
 }
 
 func statusOf(s int) int {
@@ -174,7 +182,7 @@ func Handler(next http.Handler, opts ...Option) http.Handler {
 		st := newState(cfg, cfg.root(), r.Method, "", "", reqID, trace.SpanContextFromContext(r.Context()))
 		for _, fn := range cfg.reqEnrich {
 			if l := fn(r, st.logger); l != nil {
-				st.logger = l
+				st.logger = st.adopt(cfg, l)
 			}
 		}
 		ctx := context.WithValue(r.Context(), stateKey{}, st)
@@ -227,7 +235,8 @@ type respWriter struct {
 }
 
 func (w *respWriter) WriteHeader(code int) {
-	if w.status == 0 {
+	// Informational statuses (103 Early Hints) are not the final one.
+	if w.status == 0 && !interim(code) {
 		w.status = code
 	}
 	w.ResponseWriter.WriteHeader(code)
@@ -249,7 +258,17 @@ func (w *respWriter) Flush() { _ = w.FlushError() }
 // FlushError flushes the underlying writer and returns what it reports, so
 // [http.ResponseController] sees the real result (including "not supported").
 func (w *respWriter) FlushError() error {
-	return http.NewResponseController(w.ResponseWriter).Flush() //nolint:wrapcheck // the writer's own error
+	err := http.NewResponseController(w.ResponseWriter).Flush()
+	if err == nil && w.status == 0 {
+		w.status = http.StatusOK // a flush commits the headers with the implicit 200
+	}
+
+	return err //nolint:wrapcheck // the writer's own error
+}
+
+// Hijack lets handlers take over the connection (upgrades) when the underlying writer allows it.
+func (w *respWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return http.NewResponseController(w.ResponseWriter).Hijack() //nolint:wrapcheck // the writer's own error
 }
 
 // Unwrap exposes the underlying writer to [http.ResponseController].

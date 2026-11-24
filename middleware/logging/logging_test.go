@@ -625,7 +625,7 @@ func TestStreamingFlushAndSize(t *testing.T) {
 				})
 			rec := serve(h, "/stream")
 			assert.Equal(t, "helloworld", rec.Body.String())
-			assert.True(t, rec.Flushed || an == "humachi" || an == "humatest" || an == "humago")
+			assert.True(t, rec.Flushed, "the flush reached the response writer")
 			line := find(buf.lines(t), msgRequest)
 			require.NotNil(t, line)
 			assert.InDelta(t, 10, line["response_size"], 0)

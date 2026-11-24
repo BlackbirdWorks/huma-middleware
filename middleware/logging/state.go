@@ -37,43 +37,60 @@ type state struct {
 
 // lazyHandler adds the request attributes when a record is handled, so a
 // disabled level costs nothing and an enabled one formats nothing earlier.
+//
+// It keeps two derived handlers: bare has only what the application added (the
+// attributes and groups of its With calls), full also has the request
+// attributes, bound just before the first group so they stay at the top level.
+// Until a group is opened the request attributes are added to each record
+// instead, which is cheaper to derive.
 type lazyHandler struct {
-	inner slog.Handler
-	st    *state
-	cfg   *config
+	full    slog.Handler
+	bare    slog.Handler
+	st      *state
+	cfg     *config
+	grouped bool
+	// quiet drops the request attributes: the logger of a custom access log record.
 	quiet bool
 }
 
-func (h *lazyHandler) Enabled(ctx context.Context, l slog.Level) bool { return h.inner.Enabled(ctx, l) }
+func (h *lazyHandler) Enabled(ctx context.Context, l slog.Level) bool { return h.full.Enabled(ctx, l) }
 
 func (h *lazyHandler) Handle(ctx context.Context, r slog.Record) error {
-	if !h.quiet {
+	inner := h.full
+	if h.quiet {
+		inner = h.bare
+	} else if !h.grouped {
 		r.AddAttrs(h.st.requestAttrs(h.cfg)...)
 	}
 	h.st.mu.Lock()
 	r.AddAttrs(h.st.late...)
 	h.st.mu.Unlock()
 
-	return h.inner.Handle(ctx, r)
+	return inner.Handle(ctx, r)
 }
 
 // WithAttrs implements [slog.Handler].
 func (h *lazyHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &lazyHandler{inner: h.inner.WithAttrs(attrs), st: h.st, cfg: h.cfg, quiet: h.quiet}
+	d := *h
+	d.full, d.bare = h.full.WithAttrs(attrs), h.bare.WithAttrs(attrs)
+
+	return &d
 }
 
-// WithGroup implements [slog.Handler]; the request attributes are attached
-// before the group opens so they stay at the top level.
+// WithGroup implements [slog.Handler]; the request attributes are bound before
+// the first group opens so they stay at the top level.
 func (h *lazyHandler) WithGroup(name string) slog.Handler {
 	if name == "" {
 		return h
 	}
-	inner := h.inner
-	if !h.quiet {
-		inner = inner.WithAttrs(h.st.requestAttrs(h.cfg))
+	d := *h
+	full := h.full
+	if !h.grouped {
+		full = full.WithAttrs(h.st.requestAttrs(h.cfg))
 	}
+	d.full, d.bare, d.grouped = full.WithGroup(name), h.bare.WithGroup(name), true
 
-	return &lazyHandler{inner: inner.WithGroup(name), st: h.st, cfg: h.cfg, quiet: true}
+	return &d
 }
 
 func (s *state) requestAttrs(cfg *config) []slog.Attr {
@@ -111,23 +128,31 @@ func newState(cfg *config, root *slog.Logger, method, route, opID, reqID string,
 	if sc.IsValid() {
 		s.traceID, s.spanID, s.hasTrace = sc.TraceID(), sc.SpanID(), true
 	}
-	s.handler = lazyHandler{inner: root.Handler(), st: s, cfg: cfg}
+	s.handler = lazyHandler{full: root.Handler(), bare: root.Handler(), st: s, cfg: cfg}
 	s.logger = slog.New(&s.handler)
 
 	return s
 }
 
-// quietLogger returns l without the built-in request attributes when it was
-// derived from the request logger, else l.
+// quietLogger returns the request logger l without the built-in request
+// attributes. l always derives from the request logger (see adopt).
 func quietLogger(l *slog.Logger) *slog.Logger {
-	if h, ok := l.Handler().(*lazyHandler); ok && !h.quiet {
-		q := *h
-		q.quiet = true
+	h, _ := l.Handler().(*lazyHandler)
+	q := *h
+	q.quiet = true
 
-		return slog.New(&q)
+	return slog.New(&q)
+}
+
+// adopt returns l when it derives from the request logger of s; a logger the
+// application built from scratch gets the request layer (request and late
+// attributes), keeping its own destination.
+func (s *state) adopt(cfg *config, l *slog.Logger) *slog.Logger {
+	if h, ok := l.Handler().(*lazyHandler); ok && h.st == s {
+		return l
 	}
 
-	return l
+	return slog.New(&lazyHandler{full: l.Handler(), bare: l.Handler(), st: s, cfg: cfg})
 }
 
 // FromContext returns the request-scoped logger installed by the middleware.
@@ -245,6 +270,10 @@ type wrapper struct {
 }
 
 func (w *wrapper) Context() context.Context { return w.ctx }
+
+// Unwrap returns the context this one wraps, which adapters' Unwrap helpers
+// (humago.Unwrap, humachi.Unwrap) follow to reach the request and the writer.
+func (w *wrapper) Unwrap() huma.Context { return w.base }
 
 // SetHeader sets a response header, watching the one that carries the request ID.
 func (w *wrapper) SetHeader(name, value string) {
