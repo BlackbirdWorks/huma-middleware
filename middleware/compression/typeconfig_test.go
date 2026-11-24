@@ -226,10 +226,10 @@ func TestPerTypeLevels(t *testing.T) {
 	}
 	mw := mustNew(t,
 		compression.WithDefault(compression.Config{Levels: compression.Levels{
-			Gzip: 1, Brotli: 1, Zstd: 1,
+			Gzip: new(1), Brotli: new(0), Zstd: new(1),
 		}}),
 		compression.WithContentType(ctHTML, compression.Config{Levels: compression.Levels{
-			Gzip: 9, Brotli: 11, Zstd: 22,
+			Gzip: new(9), Brotli: new(11), Zstd: new(22),
 		}}),
 	)
 	tests := []struct {
@@ -255,10 +255,10 @@ func TestPoolsPerLevelInParallel(t *testing.T) {
 
 	mw := mustNew(
 		t,
-		compression.WithDefault(compression.Config{Levels: compression.Levels{Gzip: 1}}),
+		compression.WithDefault(compression.Config{Levels: compression.Levels{Gzip: new(1)}}),
 		compression.WithContentType(
 			ctHTML,
-			compression.Config{Levels: compression.Levels{Gzip: 9}},
+			compression.Config{Levels: compression.Levels{Gzip: new(9)}},
 		),
 	)
 	tests := []struct {

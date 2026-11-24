@@ -67,10 +67,10 @@ func BenchmarkZstd(b *testing.B) { runBench(b, benchHandler(newBenchMW(b)), encZ
 
 func BenchmarkPerContentTypeConfig(b *testing.B) {
 	mw, err := compression.New(
-		compression.WithDefault(compression.Config{Levels: compression.Levels{Gzip: 1}}),
+		compression.WithDefault(compression.Config{Levels: compression.Levels{Gzip: new(1)}}),
 		compression.WithContentType("application/json", compression.Config{
 			Preference: []compression.Encoding{compression.Gzip},
-			Levels:     compression.Levels{Gzip: 9},
+			Levels:     compression.Levels{Gzip: new(9)},
 		}),
 	)
 	require.NoError(b, err)

@@ -179,11 +179,11 @@ func levelOpt(enc compression.Encoding, level int) compression.Option {
 	var levels compression.Levels
 	switch enc {
 	case compression.Brotli:
-		levels.Brotli = level
+		levels.Brotli = new(level)
 	case compression.Zstd:
-		levels.Zstd = level
+		levels.Zstd = new(level)
 	default:
-		levels.Gzip = level
+		levels.Gzip = new(level)
 	}
 
 	return compression.WithDefault(compression.Config{Levels: levels})

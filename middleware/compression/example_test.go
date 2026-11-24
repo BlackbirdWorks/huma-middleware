@@ -18,7 +18,7 @@ func ExampleNew() {
 		compression.WithDefault(compression.Config{MinSize: 1}), // compress even tiny bodies here
 		compression.WithContentType("text/html", compression.Config{
 			Preference: []compression.Encoding{compression.Gzip, compression.Brotli},
-			Levels:     compression.Levels{Gzip: 9},
+			Levels:     compression.Levels{Gzip: new(9)},
 		}),
 		compression.WithSkipPathPrefixes("/metrics"),
 	)

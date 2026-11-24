@@ -419,7 +419,8 @@ func TestLevels(t *testing.T) {
 	}{
 		{name: encGzip, enc: compression.Gzip, fast: 1, best: 9},
 		{name: "gzip huffman only", enc: compression.Gzip, fast: -2, best: 9},
-		{name: "brotli", enc: compression.Brotli, fast: 1, best: 11},
+		{name: "gzip level 0 is selectable", enc: compression.Gzip, fast: 0, best: 9},
+		{name: "brotli", enc: compression.Brotli, fast: 0, best: 11},
 		{name: encZstd, enc: compression.Zstd, fast: 1, best: 22},
 	}
 	for _, tt := range tests {
@@ -490,7 +491,7 @@ func invalidCases() []invalidCase {
 			name: "type level out of range",
 			opt: compression.WithContentType(
 				"text/*",
-				compression.Config{Levels: compression.Levels{Zstd: 99}},
+				compression.Config{Levels: compression.Levels{Zstd: new(99)}},
 			),
 			wantErr: compression.ErrInvalidLevel,
 		},
@@ -546,8 +547,8 @@ func TestValidLevelBounds(t *testing.T) {
 		{name: "gzip low", opt: levelOpt(compression.Gzip, -2)},
 		{name: "gzip default", opt: levelOpt(compression.Gzip, -1)},
 		{name: "gzip high", opt: levelOpt(compression.Gzip, 9)},
-		{name: "brotli low", opt: levelOpt(compression.Brotli, 1)},
-		{name: "zero keeps the default", opt: levelOpt(compression.Gzip, 0)},
+		{name: "brotli low", opt: levelOpt(compression.Brotli, 0)},
+		{name: "gzip no compression", opt: levelOpt(compression.Gzip, 0)},
 		{name: "brotli high", opt: levelOpt(compression.Brotli, 11)},
 		{name: "zstd low", opt: levelOpt(compression.Zstd, 1)},
 		{name: "zstd high", opt: levelOpt(compression.Zstd, 22)},

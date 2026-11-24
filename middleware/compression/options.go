@@ -26,13 +26,13 @@ var (
 )
 
 // Level ranges. Gzip takes [gzip.HuffmanOnly] (-2) to [gzip.BestCompression]
-// (9), -1 being [gzip.DefaultCompression]. Brotli takes 1 to 11. Zstd takes the
+// (9), -1 being [gzip.DefaultCompression]. Brotli takes 0 to 11. Zstd takes the
 // levels of the zstd command line tool, 1 to 22, mapped by the library to the
 // closest of its four implementations.
 const (
 	minGzipLevel   = gzip.HuffmanOnly
 	maxGzipLevel   = gzip.BestCompression
-	minBrotliLevel = 1
+	minBrotliLevel = 0
 	maxBrotliLevel = 11
 	minZstdLevel   = 1
 	maxZstdLevel   = 22
@@ -42,38 +42,34 @@ const (
 	defaultMinSize     = 1024
 )
 
-// Levels are compression levels by encoding; zero keeps the default level.
-// Ranges: gzip -2 to 9 (-1 is the library default; 0, "no compression", is not
-// available), brotli 1 to 11, zstd 1 to 22. The defaults are gzip -1, brotli 5
-// and zstd 3.
+// Levels are compression levels by encoding; a nil level keeps the default.
+// Ranges: gzip -2 to 9 (-1 is the library default, 0 no compression), brotli 0
+// to 11, zstd 1 to 22. The defaults are gzip -1, brotli 5 and zstd 3. Use
+// [Level] to write a level: Levels{Gzip: new(9)}.
 type Levels struct {
-	Gzip   int
-	Brotli int
-	Zstd   int
+	Gzip   *int
+	Brotli *int
+	Zstd   *int
 }
 
-// of returns the level of an encoding.
+// of returns the level of an encoding; every level is set in the settings of a response.
 func (l Levels) of(e Encoding) int {
 	switch e {
 	case Brotli:
-		return l.Brotli
+		return *l.Brotli
 	case Zstd:
-		return l.Zstd
+		return *l.Zstd
 	default:
-		return l.Gzip
+		return *l.Gzip
 	}
 }
 
-// overlay returns l with the non-zero levels of o applied.
+// overlay returns l with the set levels of o applied (copies, so nothing is shared with the caller).
 func (l Levels) overlay(o Levels) Levels {
-	if o.Gzip != 0 {
-		l.Gzip = o.Gzip
-	}
-	if o.Brotli != 0 {
-		l.Brotli = o.Brotli
-	}
-	if o.Zstd != 0 {
-		l.Zstd = o.Zstd
+	for _, f := range []struct{ dst, src **int }{{&l.Gzip, &o.Gzip}, {&l.Brotli, &o.Brotli}, {&l.Zstd, &o.Zstd}} {
+		if *f.src != nil {
+			*f.dst = new(**f.src)
+		}
 	}
 
 	return l
@@ -83,14 +79,14 @@ func (l Levels) overlay(o Levels) Levels {
 // one ([WithDefault]) or that of a content type ([WithContentType]). The zero
 // value of each field means "keep the default's" for a content type.
 type Config struct {
+	// Levels are the compression levels by encoding; see [Levels].
+	Levels Levels
+
 	// Preference is the server preference order. The client's q values decide
 	// first, the order breaks ties. Only the listed encodings are used. The
 	// default is brotli, gzip, zstd; for JSON ("application/json", "+json")
 	// zstd, brotli, gzip, unless the default config sets a preference.
 	Preference []Encoding
-
-	// Levels are the compression levels by encoding; see [Levels].
-	Levels Levels
 
 	// MinSize is the smallest body, in bytes, that is compressed. A response with
 	// a Content-Length below it, or that ends before reaching it, is sent as is.
@@ -160,16 +156,17 @@ func validConfig(cfg Config, isDefault bool) error {
 		return ErrEmptyPreference
 	}
 	for _, l := range []struct {
-		enc    Encoding
-		level  int
-		lo, hi int
+		level *int
+		enc   Encoding
+		lo    int
+		hi    int
 	}{
-		{Gzip, cfg.Levels.Gzip, minGzipLevel, maxGzipLevel},
-		{Brotli, cfg.Levels.Brotli, minBrotliLevel, maxBrotliLevel},
-		{Zstd, cfg.Levels.Zstd, minZstdLevel, maxZstdLevel},
+		{level: cfg.Levels.Gzip, enc: Gzip, lo: minGzipLevel, hi: maxGzipLevel},
+		{level: cfg.Levels.Brotli, enc: Brotli, lo: minBrotliLevel, hi: maxBrotliLevel},
+		{level: cfg.Levels.Zstd, enc: Zstd, lo: minZstdLevel, hi: maxZstdLevel},
 	} {
-		if l.level != 0 && (l.level < l.lo || l.level > l.hi) {
-			return fmt.Errorf("%w: %s level %d is outside %d..%d", ErrInvalidLevel, l.enc, l.level, l.lo, l.hi)
+		if l.level != nil && (*l.level < l.lo || *l.level > l.hi) {
+			return fmt.Errorf("%w: %s level %d is outside %d..%d", ErrInvalidLevel, l.enc, *l.level, l.lo, l.hi)
 		}
 	}
 	if cfg.MinSize < 0 {

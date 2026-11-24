@@ -82,6 +82,8 @@ import (
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
+
+	"github.com/blackbirdworks/huma-middleware/internal/bodywriter"
 )
 
 // Middleware is the huma middleware signature.
@@ -90,8 +92,8 @@ type Middleware = func(ctx huma.Context, next func(huma.Context))
 // settings is the effective configuration of a set of responses: the default
 // with the content type's overrides applied.
 type settings struct {
-	pref     []Encoding
 	levels   Levels
+	pref     []Encoding
 	minSize  int
 	disabled bool
 	// explicit is set for entries the caller wrote: they make their content type compressible.
@@ -145,7 +147,11 @@ func New(opts ...Option) (Middleware, error) {
 		return nil, err
 	}
 	builtin := &settings{
-		levels:  Levels{Gzip: gzip.DefaultCompression, Brotli: defaultBrotliLevel, Zstd: defaultZstdLevel},
+		levels: Levels{
+			Gzip:   new(gzip.DefaultCompression),
+			Brotli: new(defaultBrotliLevel),
+			Zstd:   new(defaultZstdLevel),
+		},
 		pref:    []Encoding{Brotli, Gzip, Zstd},
 		minSize: defaultMinSize,
 	}
@@ -159,6 +165,10 @@ func New(opts ...Option) (Middleware, error) {
 	for _, e := range cfg.entries {
 		s := overlay(c.def, e.cfg)
 		s.explicit = !e.builtin
+		if e.builtin {
+			// The built-in JSON entry only changes the preference: a disabled default stays disabled.
+			s.disabled = c.def.disabled
+		}
 		all = append(all, s)
 		switch {
 		case strings.HasPrefix(e.pattern, "+"):
@@ -260,6 +270,27 @@ func globMatch(pattern, name string) bool {
 	return ok
 }
 
+// acceptEncoding returns the Accept-Encoding of the request with all its field
+// lines joined: they are one comma-separated list, but Header returns the first.
+func acceptEncoding(ctx huma.Context) string {
+	first := ctx.Header("Accept-Encoding")
+	if first == "" {
+		return ""
+	}
+	joined := first
+	count := 0
+	ctx.EachHeader(func(name, value string) {
+		if strings.EqualFold(name, "Accept-Encoding") {
+			count++
+			if count > 1 {
+				joined += ", " + value
+			}
+		}
+	})
+
+	return joined
+}
+
 func (c *compressor) handle(ctx huma.Context, next func(huma.Context)) {
 	if c.skipped(ctx) {
 		next(ctx)
@@ -270,7 +301,7 @@ func (c *compressor) handle(ctx huma.Context, next func(huma.Context)) {
 		base:   ctx,
 		c:      c,
 		sink:   ctx.BodyWriter(),
-		accept: ctx.Header("Accept-Encoding"),
+		accept: acceptEncoding(ctx),
 		method: ctx.Method(),
 	}
 	done := false
@@ -441,14 +472,7 @@ func (r *response) Unwrap() huma.Context { return r.base }
 // SetWriteDeadline forwards to the writer under the response, so huma's SSE
 // support can still apply its per-send write timeout through the compressed body writer.
 func (r *response) SetWriteDeadline(t time.Time) error {
-	if d, ok := r.sink.(interface{ SetWriteDeadline(time.Time) error }); ok {
-		return d.SetWriteDeadline(t) //nolint:wrapcheck // the writer's own error
-	}
-	if rw, ok := r.sink.(http.ResponseWriter); ok {
-		return http.NewResponseController(rw).SetWriteDeadline(t) //nolint:wrapcheck // the writer's own error
-	}
-
-	return http.ErrNotSupported
+	return (&bodywriter.Passthrough{W: r.sink}).SetWriteDeadline(t) //nolint:wrapcheck // the writer's own error
 }
 
 // BodyWriter returns the writer the handler writes the body to.
