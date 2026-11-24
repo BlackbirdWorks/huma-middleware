@@ -21,6 +21,7 @@ import (
 )
 
 const (
+	pathEvil      = "/evil.example"
 	pathDotInside = "/a/./b"
 	pathAB        = "/a/b"
 	pathEncLead   = "/%2Fa"
@@ -102,6 +103,15 @@ func FuzzClean(f *testing.F) {
 			for seg := range strings.SplitSeq(lower, "/") {
 				assert.NotContains(t, []string{".", "..", "%2e", ".%2e", "%2e.", "%2e%2e"}, seg)
 			}
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", http.NoBody)
+			c := *u
+			req.URL = &c
+			cleanpath.Handler(cleanpath.WithMode(cleanpath.Redirect), cleanpath.WithTrailingSlash(ts))(
+				http.NotFoundHandler()).ServeHTTP(rec, req)
+			if loc := rec.Header().Get("Location"); loc != "" {
+				assertSameOrigin(t, loc)
+			}
 			assert.NotContains(t, e+"/", "/./")
 			assert.NotContains(t, e+"/", "/../")
 		}
@@ -140,6 +150,24 @@ func runRewriteKeepSlash(t *testing.T) {
 		wantRaw     string
 	}{
 		{name: "clean", target: pathAB, wantEscaped: pathAB, wantPath: pathAB},
+		{
+			name:        "scheme-relative host",
+			target:      "//evil.example",
+			wantEscaped: pathEvil,
+			wantPath:    pathEvil,
+		},
+		{
+			name:        "three slashes host",
+			target:      "///evil.example/x",
+			wantEscaped: "/evil.example/x",
+			wantPath:    "/evil.example/x",
+		},
+		{
+			name:        "dotdot then double slash",
+			target:      "/a/..//evil.example",
+			wantEscaped: pathEvil,
+			wantPath:    pathEvil,
+		},
 		{name: "root", target: "/", wantEscaped: "/", wantPath: "/"},
 		{
 			name:        "leading double slash",
@@ -340,17 +368,19 @@ func TestWithMode(t *testing.T) {
 	}
 }
 
-func runRedirect(t *testing.T) {
-	t.Helper()
+// redirectCase is a request to the Redirect mode and what it must answer.
+type redirectCase struct {
+	name         string
+	method       string
+	target       string
+	wantLocation string
+	wantCode     int
+	wantCalled   bool
+}
 
-	tests := []struct {
-		name         string
-		method       string
-		target       string
-		wantLocation string
-		wantCode     int
-		wantCalled   bool
-	}{
+// redirectCases are the cases of the Redirect mode.
+func redirectCases() []redirectCase {
+	return []redirectCase{
 		{
 			name:         "get",
 			method:       http.MethodGet,
@@ -416,13 +446,99 @@ func runRedirect(t *testing.T) {
 		},
 		{name: "clean passes", method: http.MethodGet, target: pathAB, wantCode: http.StatusOK, wantCalled: true},
 	}
+}
+
+// openRedirectCases are attempts at an open redirect: whatever the path, the Location is a same-origin path.
+func openRedirectCases() []redirectCase {
+	return []redirectCase{
+		{
+			name:         "scheme-relative host",
+			method:       http.MethodGet,
+			target:       "//evil.example",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: pathEvil,
+		},
+		{
+			name:       "backslash host",
+			method:     http.MethodGet,
+			target:     "/\\evil.example",
+			wantCode:   http.StatusOK,
+			wantCalled: true,
+		},
+		{
+			name:         "encoded backslash host",
+			method:       http.MethodGet,
+			target:       "/%5Cevil.example//x",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: "/%5Cevil.example/x",
+		},
+		{
+			name:         "encoded slashes host",
+			method:       http.MethodGet,
+			target:       "/%2F%2Fevil.example//x",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: "/%2F%2Fevil.example/x",
+		},
+		{
+			name:         "three slashes host",
+			method:       http.MethodGet,
+			target:       "///evil.example",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: pathEvil,
+		},
+		{
+			name:         "dot then backslash",
+			method:       http.MethodGet,
+			target:       "/./\\evil.example",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: "/%5Cevil.example",
+		},
+		{
+			name:         "dotdot then double slash",
+			method:       http.MethodGet,
+			target:       "/a/..//evil.example",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: pathEvil,
+		},
+		{
+			name:         "tab between slashes",
+			method:       http.MethodGet,
+			target:       "/%09/evil.example//x",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: "/%09/evil.example/x",
+		},
+		{
+			name:         "host with query",
+			method:       http.MethodGet,
+			target:       "//evil.example?next=//other",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: "/evil.example?next=//other",
+		},
+		{
+			name:       "backslash host with query",
+			method:     http.MethodGet,
+			target:     "/\\evil.example?x=1",
+			wantCode:   http.StatusOK,
+			wantCalled: true,
+		},
+	}
+}
+
+func runRedirect(t *testing.T) {
+	t.Helper()
+
+	tests := append(redirectCases(), openRedirectCases()...)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			rec, got, _ := run(t, tt.target, tt.method, cleanpath.WithMode(cleanpath.Redirect))
 			assert.Equal(t, tt.wantCode, rec.Code)
-			assert.Equal(t, tt.wantLocation, rec.Header().Get("Location"))
+			loc := rec.Header().Get("Location")
+			assert.Equal(t, tt.wantLocation, loc)
 			assert.Equal(t, tt.wantCalled, got.called)
+			if loc != "" {
+				assertSameOrigin(t, loc)
+			}
 		})
 	}
 }
@@ -674,4 +790,19 @@ func TestWithRejectHandler(t *testing.T) {
 			assert.Equal(t, tt.wantStatus, rec.Code)
 		})
 	}
+}
+
+// assertSameOrigin checks that a redirect target is an absolute path on the same host: it parses without a host and
+// does not start with two slashes or a slash and a backslash, which a browser reads as another host.
+func assertSameOrigin(t *testing.T, loc string) {
+	t.Helper()
+	loc, _, _ = strings.Cut(loc, "?") // the query is the client's, and may hold anything
+	u, err := url.Parse(loc)
+	require.NoError(t, err)
+	assert.Empty(t, u.Host)
+	assert.Empty(t, u.Scheme)
+	assert.True(t, strings.HasPrefix(loc, "/"))
+	assert.False(t, strings.HasPrefix(loc, "//"))
+	assert.False(t, strings.HasPrefix(loc, "/\\"))
+	assert.NotContains(t, loc[:min(len(loc), 3)], "\t")
 }

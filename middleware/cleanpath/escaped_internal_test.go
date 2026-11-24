@@ -1,6 +1,9 @@
 package cleanpath
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 
@@ -62,4 +65,45 @@ func FuzzEscapedPath(f *testing.F) {
 		v.RawPath = raw
 		assert.Equal(t, v.EscapedPath(), escapedPath(&v))
 	})
+}
+
+// TestRedirect covers the second line of defence of redirect: a target that is not a same-origin absolute path is
+// handed to the reject handler. It is internal because the handler cannot produce such a path (it collapses repeated
+// slashes and percent-encodes backslashes and control characters), so only a direct call reaches it.
+func TestRedirect(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		cleaned  string
+		query    string
+		wantCode int
+	}{
+		{name: "absolute path", cleaned: "/a/b", wantCode: http.StatusMovedPermanently},
+		{name: "root", cleaned: "/", wantCode: http.StatusMovedPermanently},
+		{name: "double slash", cleaned: "//evil.example", wantCode: http.StatusTeapot},
+		{name: "slash backslash", cleaned: "/\\evil.example", wantCode: http.StatusTeapot},
+		{name: "tab", cleaned: "/\t/evil.example", wantCode: http.StatusTeapot},
+		{name: "newline", cleaned: "/\n/evil.example", wantCode: http.StatusTeapot},
+		{name: "delete", cleaned: "/\x7f/a", wantCode: http.StatusTeapot},
+		{name: "relative", cleaned: "evil.example", wantCode: http.StatusTeapot},
+		{name: "empty", cleaned: "", wantCode: http.StatusTeapot},
+		{name: "query after a clean path", cleaned: "/a", query: "x=//evil", wantCode: http.StatusMovedPermanently},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			reject := http.HandlerFunc(
+				func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) },
+			)
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/x", http.NoBody)
+			req.URL.RawQuery = tt.query
+			rec := httptest.NewRecorder()
+			redirect(rec, req, tt.cleaned, reject)
+			assert.Equal(t, tt.wantCode, rec.Code)
+			if tt.wantCode == http.StatusTeapot {
+				assert.Empty(t, rec.Header().Get("Location"))
+			}
+		})
+	}
 }

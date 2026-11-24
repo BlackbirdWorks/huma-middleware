@@ -140,7 +140,7 @@ func Handler(opts ...Option) func(http.Handler) http.Handler {
 			cleaned := clean(escaped, cfg.trailing)
 			switch cfg.mode {
 			case Redirect:
-				redirect(w, r, cleaned)
+				redirect(w, r, cleaned, cfg.reject)
 			case Reject:
 				cfg.reject.ServeHTTP(w, r)
 			default: // Rewrite
@@ -166,18 +166,39 @@ func serveRewritten(next http.Handler, w http.ResponseWriter, r *http.Request, c
 	next.ServeHTTP(w, r2)
 }
 
-func redirect(w http.ResponseWriter, r *http.Request, cleaned string) {
+// redirect answers with a redirect to the cleaned path. The target must be a same-origin absolute path: it starts
+// with a slash that is not followed by another slash or a backslash (a browser reads "//host" and "/\host" as
+// another host), and holds no control character (a browser drops tabs and newlines, so "/\t/host" is "//host").
+// The cleaned path of the handler always is one (repeated slashes are collapsed, and backslashes and control
+// characters are percent-encoded in an escaped path), so this is a second line of defence: a target that is not
+// is not redirected to, it goes to the reject handler.
+func redirect(w http.ResponseWriter, r *http.Request, cleaned string, reject http.Handler) {
 	target := cleaned
 	if r.URL.RawQuery != "" || r.URL.ForceQuery {
 		target += "?" + r.URL.RawQuery
+	}
+	if len(target) < 1 || target[0] != '/' || (len(target) > 1 && (target[1] == '/' || target[1] == '\\')) ||
+		hasControl(cleaned) {
+		reject.ServeHTTP(w, r)
+
+		return
 	}
 	code := http.StatusPermanentRedirect
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
 		code = http.StatusMovedPermanently
 	}
-	// The target starts with exactly one slash (repeated slashes are collapsed and a backslash is always
-	// percent-encoded in an escaped path), so it cannot name another host.
-	http.Redirect(w, r, target, code) //nolint:gosec // G710: see above, the target is a cleaned absolute path
+	http.Redirect(w, r, target, code) //nolint:gosec // G710: the target was checked above, a single-slash absolute path
+}
+
+// hasControl reports whether s holds a control character or a DEL.
+func hasControl(s string) bool {
+	for i := range len(s) {
+		if s[i] < ' ' || s[i] == 0x7f {
+			return true
+		}
+	}
+
+	return false
 }
 
 // rewrite returns a shallow copy of r whose URL carries the cleaned path.
