@@ -263,15 +263,22 @@ recommended JSON entry stays:
 func ExampleRecommended() {
 	// Start from the recommendation and change one thing: compress smaller bodies too.
 	cfg := compression.Recommended()
-	cfg.MinSize = 256
+	cfg.MinSize = 16
 	mw, err := compression.New(compression.WithDefaults(), compression.WithFallback(cfg))
 	if err != nil {
 		panic(err)
 	}
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("example", "1.0.0"))
+	api.UseMiddleware(mw)
+	huma.Get(api, "/items", func(context.Context, *struct{}) (*struct{ Body []string }, error) {
+		return &struct{ Body []string }{Body: strings.Split(strings.Repeat("item ", 10), " ")}, nil
+	})
 
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/items", http.NoBody)
+	req.Header.Set("Accept-Encoding", "gzip, zstd")
 	rec := httptest.NewRecorder()
-	serveRec(mw, http.MethodGet, "/", []string{"Accept-Encoding", "gzip, zstd"}, rec,
-		reply(http.StatusOK, []string{hdrCT, "application/json"}, strings.Repeat("a", 300)))
+	mux.ServeHTTP(rec, req)
 	fmt.Println(rec.Header().Get("Content-Encoding")) // JSON keeps preferring zstd
 	// Output: zstd
 }
@@ -299,7 +306,9 @@ func ExampleNew() {
 	mux := http.NewServeMux()
 	api := humago.New(mux, huma.DefaultConfig("example", "1.0.0"))
 	api.UseMiddleware(mw)
-	huma.Get(api, "/items", func(context.Context, *struct{}) (*listOut, error) { return &listOut{}, nil })
+	huma.Get(api, "/items", func(context.Context, *struct{}) (*struct{ Body []string }, error) {
+		return &struct{ Body []string }{Body: []string{"a"}}, nil
+	})
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/items", http.NoBody)
 	req.Header.Set("Accept-Encoding", "gzip, br, zstd")

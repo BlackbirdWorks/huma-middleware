@@ -1,9 +1,6 @@
 package compression
 
-import (
-	"slices"
-	"strings"
-)
+import "strings"
 
 // eventStream is the media type of server-sent events.
 const eventStream = "text/event-stream"
@@ -35,11 +32,6 @@ func matchType(pattern, mt string) bool {
 	default:
 		return mt == pattern
 	}
-}
-
-// isDefaultAllowed matches the recommended allow-list.
-func isDefaultAllowed(mt string) bool {
-	return slices.ContainsFunc(RecommendedAllowList(), func(p string) bool { return matchType(p, mt) })
 }
 
 // alreadyCompressed reports whether the media type is a format that is

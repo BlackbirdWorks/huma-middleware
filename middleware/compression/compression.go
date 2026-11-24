@@ -143,6 +143,7 @@ type compressor struct {
 	def       *settings
 	exact     map[string]*settings
 	pools     map[poolKey]*encoderPool
+	allow     []string
 	suffixes  []patternSettings
 	wildcards []patternSettings
 }
@@ -174,6 +175,7 @@ func New(opts ...Option) (Middleware, error) {
 	}
 	c := &compressor{
 		cfg:   cfg,
+		allow: allowList(cfg),
 		def:   overlay(recommendedSettings(), cfg.def),
 		exact: map[string]*settings{},
 		pools: map[poolKey]*encoderPool{},
@@ -220,6 +222,15 @@ func New(opts ...Option) (Middleware, error) {
 	return c.handle, nil
 }
 
+// allowList returns the allow-list in force: the caller's, else the recommended one, built once.
+func allowList(cfg *config) []string {
+	if len(cfg.types) > 0 {
+		return cfg.types
+	}
+
+	return RecommendedAllowList()
+}
+
 // settingsFor returns the settings of a media type.
 func (c *compressor) settingsFor(mt string) *settings {
 	if s, ok := c.exact[mt]; ok {
@@ -246,11 +257,8 @@ func (c *compressor) allowed(ct string) (*settings, bool) {
 	if mt == "" || alreadyCompressed(mt) || s.disabled {
 		return s, false
 	}
-	if s.explicit || (len(c.cfg.types) == 0 && isDefaultAllowed(mt)) {
-		return s, true
-	}
 
-	return s, slices.ContainsFunc(c.cfg.types, func(p string) bool { return matchType(p, mt) })
+	return s, s.explicit || slices.ContainsFunc(c.allow, func(p string) bool { return matchType(p, mt) })
 }
 
 // skipped reports whether the request is excluded before the response is known.
