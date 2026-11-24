@@ -35,6 +35,9 @@ func (w nullWriter) Header() http.Header       { return w.h }
 func (nullWriter) Write(p []byte) (int, error) { return len(p), nil }
 func (nullWriter) WriteHeader(int)             {}
 
+// Flush makes the stream benchmarks flush for every chunk, with and without the middleware.
+func (nullWriter) Flush() {}
+
 // body returns about n bytes of compressible JSON-like text.
 func perfBody(n int) []byte {
 	var sb strings.Builder
@@ -146,6 +149,7 @@ func runPerf(b *testing.B, h http.Handler, target, ae string) {
 func runPerfParallel(b *testing.B, h http.Handler, target, ae string) {
 	b.Helper()
 	b.ReportAllocs()
+	b.ResetTimer() // the handler was built with the timer running
 	b.RunParallel(func(pb *testing.PB) {
 		req := perfRequest(target, ae)
 		w := nullWriter{h: http.Header{}}

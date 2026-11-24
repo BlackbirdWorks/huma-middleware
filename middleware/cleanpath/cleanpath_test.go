@@ -308,6 +308,11 @@ func runRewriteGivesBackWhatItsCopyLearned(t *testing.T) {
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "//upload//7", &body)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	h.ServeHTTP(httptest.NewRecorder(), req)
+	t.Cleanup(func() { // the handler is called directly, so the server that removes the upload files is not there
+		if req.MultipartForm != nil {
+			assert.NoError(t, req.MultipartForm.RemoveAll())
+		}
+	})
 
 	require.NotNil(t, seen)
 	require.NotNil(t, req.MultipartForm, "the original request holds the form, so the server removes its files")
