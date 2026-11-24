@@ -2,18 +2,19 @@
 // gzip, negotiated from Accept-Encoding with its quality values. It only uses
 // the huma.Context interface.
 //
-// # Recommended configuration
+// # Defaults
 //
-// [New] with no option, or with [WithDefaults], uses the recommendation, which
-// can be read ([Recommended], [RecommendedContentTypes], [RecommendedAllowList])
-// and adjusted ([WithFallback], [WithContentType], [WithContentTypes]):
+// [New] with no option is the recommended setup: the defaults below. The options
+// are overrides on top of it, one thing at a time; [DefaultConfig] returns the
+// defaults to read or to start from ([WithDefault]).
 //
 //   - Preference brotli, gzip, zstd: brotli compresses text best (about 20% smaller
 //     than gzip on JSON); gzip is understood by every client; zstd is the last
 //     resort for clients that only offer it.
 //   - Preference for JSON ("application/json", "+json") zstd, brotli, gzip: zstd
 //     is as small as gzip level 9 at a fraction of the cost, which suits
-//     responses built per request.
+//     responses built per request. The rule follows a fallback preference that
+//     includes zstd.
 //   - gzip level 6, the library default: the same ratio as level 9 at a sixth of
 //     the time, and 4% smaller than level 5 for 20% more time.
 //   - brotli level 5: levels 6 to 8 do not compress better and cost up to twice
@@ -22,19 +23,20 @@
 //     other, level 9 is 7% smaller for 35% more time and four times the memory.
 //   - Minimum size 1024 bytes: about one TCP segment, so below it a response
 //     fits one packet whether compressed or not.
-//   - Allow-list: text, JSON, XML, JavaScript and the other text formats ("text/*",
-//     the "+json" and "+xml" suffixes, ...); never images (but SVG), video,
-//     audio, archives, PDF and fonts, which are compressed already, and never
-//     "text/event-stream", which is compressed only when named exactly.
+//   - Content types: text, JSON, XML, JavaScript and the other text formats
+//     ("text/*", the "+json" and "+xml" suffixes, ...); never images (but SVG),
+//     video, audio, archives, PDF and fonts, which are compressed already, and
+//     never "text/event-stream": no wildcard matches it, it is compressed only
+//     when named exactly.
 //
-// The figures are from BenchmarkLevels on a 19 KB JSON list (README).
+// The figures are from BenchmarkLevels on a JSON body and a text body (README).
 //
 // # Negotiation
 //
 // The coding with the highest q wins; ties go to the server preference. By
 // default JSON ("application/json", "+json") prefers zstd, then brotli, then
 // gzip, and everything else brotli, then gzip, then zstd. Both orders can be
-// replaced for all responses ([WithFallback]) and per content type
+// replaced for all responses ([WithDefault]) and per content type
 // ([WithContentType]). [Negotiate] is the pure function behind it.
 // A request without Accept-Encoding, or accepting nothing usable, gets the
 // response as is; the middleware never answers 406.
@@ -42,7 +44,7 @@
 // # Configuration
 //
 // A [Config] holds a preference order, compression levels by encoding, a minimum
-// size and a disabled flag. [WithFallback] sets the fallback one; [WithContentType]
+// size and a disabled flag. [WithDefault] sets the fallback one; [WithContentType]
 // sets one for a content type, which inherits what it leaves at the zero value.
 // The entry that matches a response is the most specific one: an exact type
 // ("application/json"), then a suffix ("+json", the longest), then a wildcard
@@ -53,7 +55,7 @@
 //
 // Only content types on the allow-list ([WithContentTypes]; text, JSON, XML,
 // JavaScript and similar by default) and never formats that are compressed
-// already. Bodies below [Config.MinSize] (1024 bytes recommended) are sent as is:
+// already. Bodies below [Config.MinSize] (1024 bytes by default) are sent as is:
 // a response with a known Content-Length is decided at once, otherwise up to
 // that many bytes are buffered. Responses are not compressed for HEAD, 204, 304,
 // 206 and 1xx statuses, when Content-Encoding is already set, or when
@@ -176,7 +178,7 @@ func New(opts ...Option) (Middleware, error) {
 	c := &compressor{
 		cfg:   cfg,
 		allow: allowList(cfg),
-		def:   overlay(recommendedSettings(), cfg.def),
+		def:   overlay(defaultSettings(), cfg.def),
 		exact: map[string]*settings{},
 		pools: map[poolKey]*encoderPool{},
 	}
@@ -222,13 +224,13 @@ func New(opts ...Option) (Middleware, error) {
 	return c.handle, nil
 }
 
-// allowList returns the allow-list in force: the caller's, else the recommended one, built once.
+// allowList returns the allow-list in force: the caller's, else the built-in one, built once.
 func allowList(cfg *config) []string {
 	if len(cfg.types) > 0 {
 		return cfg.types
 	}
 
-	return RecommendedAllowList()
+	return defaultAllowList()
 }
 
 // settingsFor returns the settings of a media type.

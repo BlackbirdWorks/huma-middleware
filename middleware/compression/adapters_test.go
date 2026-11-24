@@ -81,7 +81,7 @@ func TestUnderRealAdapters(t *testing.T) {
 		wantContains string
 	}{
 		{name: "json zstd", path: pathList, ae: allAE, wantEncoding: encZstd, wantContains: itemValue},
-		{name: "json brotli", path: pathList, ae: "gzip, br", wantEncoding: encBrotli, wantContains: itemValue},
+		{name: "json brotli", path: pathList, ae: aeGzipBr, wantEncoding: encBrotli, wantContains: itemValue},
 		{name: "json gzip", path: pathList, ae: encGzip, wantEncoding: encGzip, wantContains: itemValue},
 		{name: "json identity", path: pathList, ae: "", wantContains: itemValue},
 		{name: "flushed stream", path: "/stream", ae: encGzip, wantEncoding: encGzip, wantContains: "first;second"},
@@ -91,7 +91,7 @@ func TestUnderRealAdapters(t *testing.T) {
 			t.Run(an+"/"+tt.name, func(t *testing.T) {
 				t.Parallel()
 				h, api := mk(t)
-				api.UseMiddleware(mustNew(t, compression.WithFallback(compression.Config{MinSize: 1})))
+				api.UseMiddleware(mustNew(t, compression.WithDefault(compression.Config{MinSize: 1})))
 				registerRoutes(api)
 
 				req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, tt.path, http.NoBody)

@@ -85,7 +85,7 @@ func TestAllTogether(t *testing.T) {
 				logger := slog.New(slog.NewJSONHandler(&logs, nil))
 
 				router, api := mk()
-				compress, err := compression.New(compression.WithFallback(compression.Config{MinSize: 1}))
+				compress, err := compression.New(compression.WithDefault(compression.Config{MinSize: 1}))
 				require.NoError(t, err)
 				api.UseMiddleware(
 					tracing.New(tracing.WithTracerProvider(tp), tracing.WithPropagators(propagation.TraceContext{})),

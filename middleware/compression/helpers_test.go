@@ -47,6 +47,8 @@ const (
 	encFake  = "deflate"
 	opID     = "op-x"
 	ctJS     = "application/javascript"
+	ctVendor = "application/vnd.api+json"
+	aeGzipBr = "gzip, br"
 	ctZip    = "application/zip"
 	encIdent = "identity"
 )
@@ -189,5 +191,5 @@ func levelOpt(enc compression.Encoding, level int) compression.Option {
 		levels.Gzip = new(level)
 	}
 
-	return compression.WithFallback(compression.Config{Levels: levels})
+	return compression.WithDefault(compression.Config{Levels: levels})
 }

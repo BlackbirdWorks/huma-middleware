@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -67,10 +68,43 @@ func apiBody(b *testing.B) []byte {
 	return body
 }
 
-// BenchmarkLevels compares the compression levels on a representative JSON body: ns/op, and the ratio of the
-// compressed size to the original (lower is better) as a custom metric.
+// textBody returns about 20 KB of HTML prose: paragraphs built from a vocabulary, with repeated markup.
+func textBody() []byte {
+	words := strings.Fields(`the quick brown fox jumps over a lazy dog while compression algorithms trade speed
+		for size and every response that leaves a server is measured in bytes latency and cost so a sensible default
+		matters more than a clever one because most services never tune it and the network is shared by many clients`)
+	var sb strings.Builder
+	sb.WriteString("<!doctype html><html><head><title>Report</title></head><body>\n")
+	for i := range 40 {
+		sb.WriteString("<section class=\"entry\"><h2>Entry " + strconv.Itoa(i) + "</h2><p>")
+		for j := range 55 {
+			sb.WriteString(words[(i*7+j*13+j*j)%len(words)])
+			sb.WriteByte(' ')
+		}
+		sb.WriteString("</p></section>\n")
+	}
+	sb.WriteString("</body></html>\n")
+
+	return []byte(sb.String())
+}
+
+// BenchmarkLevels compares the compression levels on a representative JSON body and on a text (HTML) body:
+// ns/op, and the ratio of the compressed size to the original (lower is better) as a custom metric.
 func BenchmarkLevels(b *testing.B) {
-	body := apiBody(b)
+	bodies := []struct {
+		name, ct string
+		body     []byte
+	}{
+		{"json", ctJSON, apiBody(b)},
+		{"text", ctHTML, textBody()},
+	}
+	for _, bd := range bodies {
+		b.Run(bd.name, func(b *testing.B) { benchLevels(b, bd.ct, bd.body) })
+	}
+}
+
+func benchLevels(b *testing.B, ct string, body []byte) {
+	b.Helper()
 	tests := []struct {
 		enc    compression.Encoding
 		levels []int
@@ -91,7 +125,7 @@ func BenchmarkLevels(b *testing.B) {
 				default:
 					levels.Gzip = new(level)
 				}
-				mw, err := compression.New(compression.WithFallback(compression.Config{
+				mw, err := compression.New(compression.WithDefault(compression.Config{
 					Levels: levels, Preference: []compression.Encoding{tt.enc},
 				}))
 				require.NoError(b, err)
@@ -99,7 +133,7 @@ func BenchmarkLevels(b *testing.B) {
 				req.Header.Set("Accept-Encoding", string(tt.enc))
 				op := &huma.Operation{OperationID: "x", Path: "/x"}
 				w := &countingWriter{h: http.Header{}}
-				next := reply(http.StatusOK, []string{hdrCT, ctJSON}, string(body))
+				next := reply(http.StatusOK, []string{hdrCT, ct}, string(body))
 				b.SetBytes(int64(len(body)))
 				b.ReportAllocs()
 				for b.Loop() {
