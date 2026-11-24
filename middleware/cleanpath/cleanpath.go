@@ -59,6 +59,7 @@
 package cleanpath
 
 import (
+	"bytes"
 	"net/http"
 	"net/url"
 	"strings"
@@ -130,7 +131,7 @@ func Handler(opts ...Option) func(http.Handler) http.Handler {
 
 				return
 			}
-			escaped := r.URL.EscapedPath()
+			escaped := escapedPath(r.URL)
 			if isClean(escaped, cfg.trailing) {
 				next.ServeHTTP(w, r)
 
@@ -181,23 +182,90 @@ func redirect(w http.ResponseWriter, r *http.Request, cleaned string) {
 
 // rewrite returns a shallow copy of r whose URL carries the cleaned path.
 func rewrite(r *http.Request, cleaned string) *http.Request {
-	u := *r.URL
+	// One allocation for the copies of the request and of its URL.
+	cp := new(copied)
+	cp.req, cp.url = *r, *r.URL
 	// The cleaned string only rearranges the well-formed escapes of
 	// EscapedPath, so it always unescapes; the error cannot happen.
-	u.Path, _ = url.PathUnescape(cleaned)
-	u.RawPath = ""
-	if u.EscapedPath() != cleaned {
-		u.RawPath = cleaned
+	cp.url.Path, _ = url.PathUnescape(cleaned)
+	cp.url.RawPath = ""
+	if cp.url.EscapedPath() != cleaned {
+		cp.url.RawPath = cleaned
 	}
-	r2 := new(http.Request)
-	*r2 = *r
-	r2.URL = &u
+	cp.req.URL = &cp.url
 	if r.RequestURI != "" {
 		// Keep it consistent with the URL: the cleaned escaped path and the original query.
-		r2.RequestURI = u.RequestURI()
+		cp.req.RequestURI = cp.url.RequestURI()
 	}
 
-	return r2
+	return &cp.req
+}
+
+// copied is a request and its URL, allocated together.
+type copied struct {
+	req http.Request
+	url url.URL
+}
+
+// escapedPath is [url.URL.EscapedPath] without its allocation for a percent-encoded request: when RawPath is
+// valid and decodes to Path, which the server guarantees, it is the escaped path, and checking it needs no memory.
+func escapedPath(u *url.URL) string {
+	if u.RawPath != "" && rawMatches(u.RawPath, u.Path) {
+		return u.RawPath
+	}
+
+	return u.EscapedPath()
+}
+
+// rawMatches reports whether raw is a valid escaped path that decodes to path, as EscapedPath requires.
+func rawMatches(raw, path string) bool {
+	j := 0
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if c == '%' {
+			if i+2 >= len(raw) || !isHex(raw[i+1]) || !isHex(raw[i+2]) {
+				return false
+			}
+			c = unhex(raw[i+1])<<hexShift | unhex(raw[i+2])
+			i += 2
+		} else if !validRaw(c) {
+			return false
+		}
+		if j >= len(path) || path[j] != c {
+			return false
+		}
+		j++
+	}
+
+	return j == len(path)
+}
+
+// hexShift is the width of a hex digit in bits.
+const hexShift = 4
+
+func isHex(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
+}
+
+func unhex(c byte) byte {
+	switch {
+	case c <= '9':
+		return c - '0'
+	case c <= 'F':
+		return c - 'A' + 10 //nolint:mnd // hex digit value
+	default:
+		return c - 'a' + 10 //nolint:mnd // hex digit value
+	}
+}
+
+// validRaw reports whether a byte may appear unescaped in an escaped path (the set of url.validEncoded).
+func validRaw(c byte) bool {
+	switch {
+	case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9':
+		return true
+	}
+
+	return strings.IndexByte("-._~/!$&'()*+,;=:@[]", c) >= 0
 }
 
 // isDot reports whether the escaped segment is "." (also "%2e").
@@ -244,33 +312,29 @@ func isClean(p string, ts TrailingSlash) bool {
 
 // clean returns the cleaned escaped path.
 func clean(p string, ts TrailingSlash) string {
+	var stack [256]byte // most paths fit: the result is built here and copied once
+	buf := stack[:0]
 	trailing := strings.HasSuffix(p, "/")
-	segs := make([]string, 0, strings.Count(p, "/")+1)
 	for rest := p; rest != ""; {
 		var seg string
 		seg, rest, _ = strings.Cut(rest, "/")
 		switch {
 		case seg == "" || isDot(seg):
 		case isDotDot(seg):
-			if len(segs) > 0 {
-				segs = segs[:len(segs)-1]
+			if i := bytes.LastIndexByte(buf, '/'); i >= 0 {
+				buf = buf[:i]
 			}
 		default:
-			segs = append(segs, seg)
+			buf = append(buf, '/')
+			buf = append(buf, seg...)
 		}
 	}
-	if len(segs) == 0 {
+	if len(buf) == 0 {
 		return "/"
 	}
-	var b strings.Builder
-	b.Grow(len(p) + 1)
-	for _, s := range segs {
-		b.WriteByte('/')
-		b.WriteString(s)
-	}
 	if ts == AddSlash || (ts == KeepSlash && trailing) {
-		b.WriteByte('/')
+		buf = append(buf, '/')
 	}
 
-	return b.String()
+	return string(buf)
 }
