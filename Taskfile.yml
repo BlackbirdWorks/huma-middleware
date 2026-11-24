@@ -43,25 +43,28 @@ tasks:
     desc: Run every fuzz test for a bounded time (task fuzz FUZZTIME=10s)
     cmds:
       - |
+        set -e
         for pkg in $(go list ./...); do
-          for f in $(go test "$pkg" -list '^Fuzz' | grep '^Fuzz' || true); do
+          # A package that does not compile fails the listing, and the task with it.
+          listing=$(go test "$pkg" -list '^Fuzz')
+          for f in $(echo "$listing" | grep '^Fuzz' || true); do
             echo "-> $pkg $f"
-            go test "$pkg" -run='^$' -fuzz="^$f$" -fuzztime={{.FUZZTIME}} || exit 1
+            go test "$pkg" -run='^$' -fuzz="^$f$" -fuzztime={{.FUZZTIME}}
           done
         done
 
   lint-install:
-    desc: Install the pinned golangci-lint into the Go bin directory if missing
+    desc: Install the pinned golangci-lint into ./bin if missing
     status:
-      - golangci-lint version 2>/dev/null | grep -q "version {{trimPrefix "v" .GOLANGCI_LINT_VERSION}} "
+      - ./bin/golangci-lint version 2>/dev/null | grep -q "version {{trimPrefix "v" .GOLANGCI_LINT_VERSION}} "
     cmds:
-      - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GOLANGCI_LINT_VERSION}}
+      - GOBIN="{{.ROOT_DIR}}/bin" go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GOLANGCI_LINT_VERSION}}
 
   lint:
     desc: Run golangci-lint (every linter) and mulint
     deps: [lint-install]
     cmds:
-      - golangci-lint run --timeout=20m --config .golangci.yml ./...
+      - ./bin/golangci-lint run --timeout=20m --config .golangci.yml ./...
       - go vet -vettool="$(go tool -n mulint-vet)" ./...
 
   tidy:

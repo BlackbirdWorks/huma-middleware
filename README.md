@@ -95,9 +95,9 @@ and the meter provider were passed explicitly (`WithTracerProvider`, `WithMeterP
 `go.opentelemetry.io/otel/trace/noop` and `go.opentelemetry.io/otel/metric/noop` (values or pointers). `WithEnabled(true)`
 forces it on. Not detected: the global providers (the global tracer provider is a delegate that can receive a real
 provider after the middleware was built, so it is never treated as disabled), types embedding a no-op provider, and
-only one of the two being a no-op (it then works normally). Pass providers explicitly. The propagator's header names are
-read once at construction, from `WithPropagators` or the global propagator at that time, so configure OpenTelemetry
-before building the middleware or pass the propagator.
+only one of the two being a no-op (it then works normally). Pass providers explicitly. With `WithPropagators` only the headers the
+propagator declares are copied into the view; without it every request header is visible to the global propagator,
+so one registered after the middleware was built still works.
 
 How it reuses otelhttp: one `otelhttp` handler is built at construction. Per request the middleware fills a pooled
 `http.Request` view of the `huma.Context` (method, URL, host, remote address, protocol, TLS, the propagator headers,
