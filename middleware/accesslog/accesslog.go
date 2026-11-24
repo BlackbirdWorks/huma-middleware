@@ -17,6 +17,11 @@
 // handler allocates to format the record is the handler's: [slog.JSONHandler] and [slog.TextHandler] do. Opting in to
 // [WithHeaders], [WithAttrs], [WithRecordFunc] or [WithRequestIDGenerator] adds the allocations of that feature.
 //
+// The record is made of attributes that are groups with an empty key (every handler inlines them) over slices that
+// are pooled with the request state, which is what makes it allocation free. A log handler that keeps the record
+// after Handle returns (an asynchronous one) must be told with [WithRetainedRecords], which allocates the slices per
+// record instead.
+//
 // # With the logging middleware
 //
 // When the logging middleware is installed outside this one the record is written to its root logger with the
@@ -302,7 +307,12 @@ func (a *accessLog) write(ctx context.Context, src reqlog.Source, o *output, r *
 	}
 	f := &cfg.fields
 	o.rec = slog.NewRecord(time.Now(), level, cfg.message, 0)
-	core := append(o.attrs[:0:coreEnd],
+	attrs := o.attrs[:]
+	if cfg.retain {
+		attrs = make([]slog.Attr, maxAttrs) // a handler that keeps the record needs slices nobody reuses
+	}
+	core := attrs[:0:coreEnd]
+	core = append(core,
 		slog.String(f.Method, r.Method),
 		slog.String(f.Path, r.Path),
 		slog.Int(f.Status, r.Status),
@@ -312,7 +322,7 @@ func (a *accessLog) write(ctx context.Context, src reqlog.Source, o *output, r *
 		slog.String(f.UserAgent, r.UserAgent),
 	)
 	o.rec.AddAttrs(slog.Attr{Value: slog.GroupValue(core...)}) // an empty key inlines the group
-	opt := o.attrs[coreEnd:coreEnd:optEnd]
+	opt := attrs[coreEnd:coreEnd:optEnd]
 	opt = addNonEmpty(opt, f.Route, r.Route)
 	opt = addNonEmpty(opt, f.OperationID, r.OperationID)
 	opt = addNonEmpty(opt, f.RequestID, r.RequestID)
@@ -326,7 +336,7 @@ func (a *accessLog) write(ctx context.Context, src reqlog.Source, o *output, r *
 		o.rec.AddAttrs(cfg.attrs(r)...)
 	}
 	if src != nil {
-		src.AddIDs(&o.rec, o.attrs[optEnd:optEnd:idsEnd])
+		src.AddIDs(&o.rec, attrs[optEnd:optEnd:idsEnd])
 	}
 	_ = h.Handle(ctx, o.rec) // the handler's own error has nobody to go to, as with Logger.LogAttrs
 }

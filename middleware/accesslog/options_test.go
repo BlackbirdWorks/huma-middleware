@@ -729,3 +729,73 @@ func TestDefaultLevels(t *testing.T) {
 		})
 	}
 }
+
+// keepingHandler keeps every record it is given, as an asynchronous handler does.
+type keepingHandler struct {
+	records *[]slog.Record
+}
+
+func (keepingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h keepingHandler) Handle(_ context.Context, r slog.Record) error {
+	*h.records = append(*h.records, r)
+
+	return nil
+}
+
+func (h keepingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h keepingHandler) WithGroup(string) slog.Handler      { return h }
+
+// flatten lists the attributes of a record with the groups that have an empty key inlined.
+func flatten(r slog.Record) map[string]string {
+	out := map[string]string{}
+	var add func(a slog.Attr)
+	add = func(a slog.Attr) {
+		if a.Value.Kind() == slog.KindGroup {
+			for _, g := range a.Value.Group() {
+				add(g)
+			}
+
+			return
+		}
+		out[a.Key] = a.Value.String()
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		add(a)
+
+		return true
+	})
+
+	return out
+}
+
+// TestWithRetainedRecords covers the handlers that keep the record: what they kept is not changed by later requests.
+func TestWithRetainedRecords(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		retain bool
+	}{
+		{name: "retained", retain: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var kept []slog.Record
+			opts := []accesslog.Option{accesslog.WithLogger(slog.New(keepingHandler{&kept}))}
+			if tt.retain {
+				opts = append(opts, accesslog.WithRetainedRecords())
+			}
+			h := accesslog.Handler(opts...)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+			for _, path := range []string{"/first", "/second", "/third"} {
+				serve(h, path)
+			}
+			require.Len(t, kept, 3)
+			for i, path := range []string{"/first", "/second", "/third"} {
+				assert.Equal(t, path, flatten(kept[i])["path"])
+				assert.Equal(t, wantAgent, flatten(kept[i])["user_agent"])
+			}
+		})
+	}
+}

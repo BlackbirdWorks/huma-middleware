@@ -97,21 +97,21 @@ func (l Levels) of(status int) slog.Level {
 type Option func(*config)
 
 type config struct {
-	attrs     func(*Record) []slog.Attr
+	emit      func(context.Context, *slog.Logger, *Record)
+	idGen     func() string
 	logger    *slog.Logger
 	clock     func() time.Time
 	skip      func(huma.Context) bool
 	reqSkip   func(*http.Request) bool
-	emit      func(context.Context, *slog.Logger, *Record)
-	idGen     func() string
+	attrs     func(*Record) []slog.Attr
 	fields    Fields
+	idKey     string
 	requestID string
-	// idKey is requestID in the canonical form of header keys, so that looking it up does not allocate.
-	idKey    string
-	message  string
-	headers  []string
-	redacted []string
-	levels   Levels
+	message   string
+	headers   []string
+	redacted  []string
+	levels    Levels
+	retain    bool
 }
 
 func newConfig(opts []Option) *config {
@@ -211,3 +211,9 @@ func WithRequestIDHeader(name string) Option { return func(c *config) { c.reques
 // [WithRequestIDHeader] and carried by the record. It is the one place the middleware allocates by itself, and only
 // when it runs.
 func WithRequestIDGenerator(fn func() string) Option { return func(c *config) { c.idGen = fn } }
+
+// WithRetainedRecords is for a log handler that keeps the record after its Handle method returns, as an asynchronous
+// handler does: the attribute slices the record points to are allocated for each record instead of being pooled with
+// the request state, so a later request cannot change them. It costs the allocations the default avoids. The
+// handlers of the standard library do not keep records.
+func WithRetainedRecords() Option { return func(c *config) { c.retain = true } }
