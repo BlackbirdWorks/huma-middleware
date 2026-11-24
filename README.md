@@ -519,6 +519,72 @@ func main() {
 - **authentication**: before `logging` when the logs should carry the user, or call `logging.AddAttrs(ctx, ...)` once the
   user is known.
 
+## Performance
+
+What each middleware adds to a request, measured against the same API without it (`bare/*`: huma on `net/http`, 5
+allocations and about 440 ns per request, which is huma's own). The numbers are from `BenchmarkPerf` in `middleware/`
+(`task bench`): test binaries built once for v0.1.0 and for this version, run alternately on two pinned cores, one CPU,
+10 runs each, medians below (`benchstat` on the same runs says every difference marked here is significant). The bare
+rows differ by about 4% between the two binaries (the same huma code): read the ns column with that offset, the
+allocation columns are exact.
+
+| Case | v0.1.0 | this version | ns | allocs v0.1.0 | allocs now | B/op v0.1.0 | B/op now |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `bare/tiny` | 426 ns | 447 ns | +5% | 5 | 5 | 144 | 144 |
+| `bare/big` | 428 ns | 443 ns | +4% | 5 | 5 | 144 | 144 |
+| `bare/encoded` | 544 ns | 567 ns | +4% | 7 | 7 | 160 | 160 |
+| `tracing/disabled` | 436 ns | 462 ns | +6% | 5 | 5 | 144 | 144 |
+| `tracing/filtered` | 443 ns | 473 ns | +7% | 5 | 5 | 144 | 144 |
+| `tracing/enabled-noop` | 4.81 µs | 4.92 µs | +2% | 37 | 37 | 3616 | 3616 |
+| `tracing/recording` | 6.61 µs | 6.76 µs | +2% | 41 | 41 | 6913 | 6913 |
+| `accesslog/info-nop-handler` | 1.61 µs | 994 ns | -38% | 12 | 5 | 960 | 144 |
+| `accesslog/info-json` | 2.83 µs | 1.99 µs | -30% | 12 | 5 | 960 | 144 |
+| `accesslog/level-off` | 957 ns | 725 ns | -24% | 9 | 5 | 512 | 144 |
+| `accesslog/skipped` | 819 ns | 609 ns | -26% | 9 | 5 | 512 | 144 |
+| `accesslog/net-http-info-nop-handler` | 1.92 µs | 977 ns | -49% | 16 | 5 | 1312 | 144 |
+| `accesslog/net-http-info-json` | 3.12 µs | 1.98 µs | -37% | 16 | 5 | 1312 | 144 |
+| `accesslog/net-http-level-off` | 1.30 µs | 742 ns | -43% | 13 | 5 | 896 | 144 |
+| `logging/request-state` | 814 ns | 661 ns | -19% | 9 | 6 | 512 | 496 |
+| `logging/net-http-request-state` | 1.05 µs | 759 ns | -28% | 12 | 7 | 880 | 816 |
+| `logging+accesslog/info-nop-handler` | 1.61 µs | 1.24 µs | -23% | 12 | 6 | 960 | 496 |
+| `logging+accesslog/info-json` | 2.84 µs | 2.45 µs | -13% | 12 | 6 | 960 | 496 |
+| `recovery/no-panic` | 487 ns | 508 ns | +4% | 6 | 5 | 192 | 144 |
+| `compression/not-accepted` | 860 ns | 757 ns | -12% | 7 | 6 | 384 | 160 |
+| `compression/not-compressible` | 859 ns | 612 ns | -29% | 9 | 5 | 416 | 144 |
+| `compression/below-min` | 1.02 µs | 754 ns | -26% | 10 | 6 | 432 | 160 |
+| `compression/skipped` | 445 ns | 471 ns | +6% | 5 | 5 | 144 | 144 |
+| `compression/gzip-2k` | 10.65 µs | 10.29 µs | -3% | 11 | 7 | 512 | 238 |
+| `compression/gzip-20k` | 53.32 µs | 53.06 µs | -0% | 11 | 7 | 771 | 497 |
+| `compression/brotli-20k` | 28.20 µs | 30.95 µs | +10% | 11 | 7 | 686 | 430 |
+| `compression/zstd-20k` | 11.10 µs | 10.90 µs | -2% | 11 | 7 | 559 | 284 |
+| `compression/stream-gzip` | 28.71 µs | 28.39 µs | -1% | 11 | 7 | 590 | 317 |
+| `compression/stream-passthrough` | 906 ns | 787 ns | -13% | 7 | 6 | 352 | 128 |
+| `bare/stream` | 451 ns | 460 ns | +2% | 5 | 5 | 112 | 112 |
+| `cleanpath/clean` | 468 ns | 501 ns | +7% | 5 | 5 | 144 | 144 |
+| `cleanpath/encoded-clean` | 618 ns | 621 ns | +1% | 8 | 7 | 168 | 160 |
+| `cleanpath/rewrite` | 860 ns | 769 ns | -11% | 9 | 7 | 664 | 600 |
+| `chain/tiny` | 9.36 µs | 8.74 µs | -7% | 50 | 39 | 4769 | 3986 |
+| `chain/big-gzip` | 64.52 µs | 63.74 µs | -1% | 51 | 40 | 5137 | 4354 |
+| `chain/big-zstd` | 21.74 µs | 20.97 µs | -4% | 51 | 40 | 4987 | 4196 |
+| `chain-tracing-off/tiny` | 3.71 µs | 3.06 µs | -18% | 18 | 7 | 1296 | 512 |
+
+How to read it, per middleware (allocations on top of `bare`):
+
+- `accesslog` adds **0** allocations in both forms, when the record is written, when its level is off and when the
+  request is skipped (`TestAllocs` pins this against a handler that does not allocate; `slog.JSONHandler` and
+  `slog.TextHandler` allocate when they format, that is theirs). v0.1.0's access log added 4 to 11 per request.
+- `logging` adds 1: the request state, which is also the context handed on (the logger is made when first asked for, +1).
+- `recovery` adds 0 when nothing panics.
+- `compression` adds 0 when the request is skipped, not compressible or below the minimum size, 1 for the `Vary`
+  header when it is not accepted, and 2 when compressing (the encoder state is pooled; the library's own writes remain).
+- `cleanpath` adds 0 on a clean path, including an encoded one, and 2 on a rewrite (the request copy and the new path).
+- `tracing` adds 0 when disabled or filtered. An enabled middleware adds 32 in all: 4 of its own, which its
+  design needs (the context value, the request copy handed to otelhttp and huma's two context wrappers), and the rest
+  `otelhttp`'s.
+
+Every pool has a parallel `-race` test, the allocation pins skip under the race detector and run in `task allocs`
+(also in CI).
+
 ## Upgrading from v0.1.0
 
 `logging` was split: it keeps the request logger, and the access log is the new `accesslog` package. Nothing is
