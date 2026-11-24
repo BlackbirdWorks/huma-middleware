@@ -1,0 +1,81 @@
+# https://taskfile.dev - run `task` to list the tasks.
+version: "3"
+
+vars:
+  # Minimum total statement coverage (percent); override with `task coverage COVERAGE_MIN=90`.
+  COVERAGE_MIN: '{{default "100" .COVERAGE_MIN}}'
+  GOLANGCI_LINT_VERSION: v2.15.0
+  FUZZTIME: '{{default "10s" .FUZZTIME}}'
+
+tasks:
+  default:
+    desc: List the available tasks
+    silent: true
+    cmds:
+      - task --list
+
+  build:
+    desc: Build every package
+    cmds:
+      - go build ./...
+
+  test:
+    desc: Run the unit tests with the race detector
+    cmds:
+      - go test -race -shuffle=on -count=1 ./...
+
+  coverage:
+    desc: Race tests with coverage over all packages; fails below COVERAGE_MIN (default 100)
+    cmds:
+      - mkdir -p coverage
+      - go test -race -count=1 -covermode=atomic -coverpkg=./... -coverprofile=coverage/coverage.out ./...
+      - go tool cover -func=coverage/coverage.out | tail -n 1
+      - |
+        total=$(go tool cover -func=coverage/coverage.out | awk '/^total:/ {gsub("%","",$3); print $3}')
+        awk -v t="$total" -v m="{{.COVERAGE_MIN}}" 'BEGIN { if (t+0 < m+0) { printf "coverage %s%% is below %s%%\n", t, m; exit 1 } }'
+
+  bench:
+    desc: Run the benchmarks with allocation counts
+    cmds:
+      - go test -run='^$' -bench=. -benchmem ./...
+
+  fuzz:
+    desc: Run every fuzz test for a bounded time (task fuzz FUZZTIME=10s)
+    cmds:
+      - |
+        for pkg in $(go list ./...); do
+          for f in $(go test "$pkg" -list '^Fuzz' | grep '^Fuzz' || true); do
+            echo "-> $pkg $f"
+            go test "$pkg" -run='^$' -fuzz="^$f$" -fuzztime={{.FUZZTIME}} || exit 1
+          done
+        done
+
+  lint-install:
+    desc: Install the pinned golangci-lint into the Go bin directory if missing
+    status:
+      - golangci-lint version 2>/dev/null | grep -q "version {{trimPrefix "v" .GOLANGCI_LINT_VERSION}} "
+    cmds:
+      - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GOLANGCI_LINT_VERSION}}
+
+  lint:
+    desc: Run golangci-lint (every linter) and mulint
+    deps: [lint-install]
+    cmds:
+      - golangci-lint run --timeout=20m --config .golangci.yml ./...
+      - go vet -vettool="$(go tool -n mulint-vet)" ./...
+
+  tidy:
+    desc: Run go mod tidy
+    cmds:
+      - go mod tidy
+
+  tidy-check:
+    desc: Fail if go.mod or go.sum are not tidy
+    cmds:
+      - go mod tidy
+      - git diff --exit-code -- go.mod go.sum
+
+  vulncheck:
+    desc: Run govulncheck
+    cmds:
+      - go tool govulncheck ./...
