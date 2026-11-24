@@ -7,7 +7,8 @@ own package, so an application links only the dependencies of the ones it uses.
 | --- | --- | --- |
 | `middleware/cleanpath` | Cleans the request path (`//a/../b` to `/b`) before routing | `net/http` middleware, in front of the router |
 | `middleware/tracing` | OpenTelemetry server spans and HTTP server metrics, through `otelhttp` | huma middleware |
-| `middleware/logging` | Request-scoped `log/slog` logger and an access log | huma middleware |
+| `middleware/logging` | Request-scoped `log/slog` logger in the context, with enrichment | huma middleware |
+| `middleware/accesslog` | One allocation-free access log record per request | huma middleware |
 | `middleware/recovery` | Recovers panics: logs them, marks the span, answers 500 | huma middleware |
 | `middleware/compression` | zstd, brotli and gzip response compression | huma middleware |
 
@@ -110,7 +111,7 @@ seen, wrap those with `tracing.Handler`.
 
 ## logging
 
-A request-scoped `log/slog` logger in the context, and one access log record per request.
+A request-scoped `log/slog` logger in the context. It writes no access log: that is `accesslog`.
 
 <!-- example: logging ExampleNew -->
 ```go
@@ -137,33 +138,100 @@ func ExampleNew() {
 	mux.ServeHTTP(httptest.NewRecorder(), req)
 	// Output:
 	// level=INFO msg="loading user" req=abc method=GET route=/users
-	// level=INFO msg=request req=abc path=/users status=204 method=GET route=/users
 }
 ```
 
 The logger in the context carries `method`, `route`, `operation_id`, `request_id` (header `X-Request-ID`) and, when a
 span is in the context, `trace_id` and `span_id`; the attributes are added when a record is handled, so a disabled
-level costs nothing. After the response one access log record is written: path (never the query string), status
-actually sent, duration, response size, remote address and user agent, at Info, Warn for 4xx, Error for 5xx.
-`logging.FromContext(ctx)` returns the request logger (or `slog.Default()`); `logging.AddAttrs(ctx, attrs...)` adds
-attributes later in the request (for example once the user is authenticated), to the logs written afterwards and to
-the access log. `logging.Handler(next, opts...)` is the form for plain routes.
+level costs nothing. `logging.FromContext(ctx)` returns the request logger (or `slog.Default()`); `logging.NewContext`
+puts a logger in a context (tests, background work); `logging.AddAttrs(ctx, attrs...)` adds attributes later in the
+request (for example once the user is authenticated), to the logs written afterwards and to the access log record.
+`logging.Handler(next, opts...)` is the form for plain routes.
 
-Options: `WithLogger` (nil or absent means `slog.Default()`, resolved on every request), `WithFields` (rename
-attributes), `WithLevels`, `WithClock`, `WithMessage`, `WithSkip(fn)` (skips the access log), `WithoutAccessLog`,
-`WithAccessAttrs(fn)`, `WithHeaders(names...)` with `WithRedactedHeaders(names...)` (Authorization, cookies and API key
-headers are redacted by default), `WithRequestIDHeader(name)` (the request's ID, else the same header of the response: an ID an outer wrapper set,
-then the one on the response when the record is written; `Record.RequestID` is the resolved one),
-`WithRequestIDGenerator(fn)` (creates the ID last, when neither side has one, and sets it on the response; the huma form
-cannot see a header an outer middleware set earlier), `WithoutRequestAttrs`, `WithEnrichLogs(fn)` (called once per
-request, before the handlers; the returned logger is used for handler logs and the access log; several are applied in
-order; a panic in `fn` propagates) and `WithAccessLogFunc(fn)`, which replaces the access log record entirely with
-your own function and a `Record`, for applications that must keep an existing log format. `Record.Header` and
-`Record.RequestURI` read the request: call them before your function returns.
+Options: `WithLogger` (nil or absent means `slog.Default()`, resolved on every request), `WithFields` (rename the
+request attributes), `WithRequestIDHeader(name)`, `WithoutRequestAttrs`, `WithEnrichLogs(fn)` (called once per request,
+before the handlers; the returned logger is the one in the context; several are applied in order; a panic in `fn`
+propagates) and `WithRequestEnrichLogs(fn)` for `Handler`. The enrich function sees what is in the context when the
+logging middleware runs; put authentication before it, or use `AddAttrs`. The cost is one allocation per request (the
+request state, which is also the context handed on) and the logger when it is first asked for.
 
-The enrich function sees what is in the context when the logging middleware runs; put authentication before it, or use
-`AddAttrs`. On adapters that stream through a callback (Fiber) the access log is written when the handler returns, before
-the stream ends.
+## accesslog
+
+One access log record per request, after the response, without allocating: no context value, no request copy, no
+per-request logger or closure. The state of a request (the response wrapper, the byte counter and the log record) is
+pooled, the level is checked first (a disabled level costs nothing more), and the attributes are typed.
+
+<!-- example: accesslog ExampleNew -->
+```go
+func ExampleNew() {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{ReplaceAttr: dropNoise}))
+
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("example", "1.0.0"))
+	// accesslog.New() alone logs to slog.Default().
+	api.UseMiddleware(accesslog.New(accesslog.WithLogger(logger)))
+	huma.Get(api, "/users", func(context.Context, *struct{}) (*struct{}, error) { return &struct{}{}, nil })
+
+	mux.ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/users?secret=1", http.NoBody))
+	// Output: level=INFO msg=request method=GET path=/users status=204 route=/users
+}
+```
+
+The record has `method`, `path` (never the query string), `route`, `operation_id`, `status` actually sent, `duration`,
+`response_size` (what was handed to the writer, the compressed size when compression runs inside), `remote_addr`,
+`user_agent` and `request_id`, at Info, Warn for 4xx, Error for 5xx. `accesslog.Handler(opts...)(next)` is the form for
+plain routes (the route is the `ServeMux` pattern).
+
+Options: `WithLogger` (nil or absent means `slog.Default()`, resolved on every request), `WithFields`, `WithLevels`,
+`WithClock`, `WithMessage`, `WithSkip(fn)` and `WithRequestSkip(fn)`, `WithAttrs(fn)` (extra attributes),
+`WithHeaders(names...)` with `WithRedactedHeaders(names...)` (Authorization, cookies and API key headers are redacted by
+default), `WithRequestIDHeader(name)` (the request's ID, else the same header of the response when the record is
+written) and `WithRequestIDGenerator(fn)` (creates the ID when the request has none and sets it on the response), and
+`WithRecordFunc(fn)`, which replaces the record entirely with your own function, for applications that must keep an
+existing log format:
+
+<!-- example: accesslog ExampleWithRecordFunc -->
+```go
+func ExampleWithRecordFunc() {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{ReplaceAttr: dropNoise}))
+
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("example", "1.0.0"))
+	api.UseMiddleware(accesslog.New(
+		accesslog.WithLogger(logger),
+		accesslog.WithRecordFunc(func(ctx context.Context, l *slog.Logger, r *accesslog.Record) {
+			l.LogAttrs(ctx, slog.LevelInfo, "Success",
+				slog.String("request", r.Method+" "+r.RequestURI()),
+				slog.Int("status", r.Status),
+				slog.Int64("size", r.Size),
+			)
+		}),
+	))
+	huma.Get(api, "/ping", func(context.Context, *struct{}) (*struct{}, error) { return &struct{}{}, nil })
+
+	mux.ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/ping?a=1", http.NoBody))
+	// Output: level=INFO msg=Success request="GET /ping?a=1" status=204 size=0
+}
+```
+
+The `*Record` your function receives is pooled state: use it during the call and copy what you keep (`Record.Header` and
+`Record.RequestURI` read the request, call them before the function returns). `WithHeaders`, `WithAttrs`,
+`WithRecordFunc` and `WithRequestIDGenerator` allocate what their feature needs, only when used. What the log handler
+allocates to format the record is the handler's: `slog.JSONHandler` and `slog.TextHandler` allocate, a handler that does
+not (as the tests use) shows the middleware adds none.
+
+On adapters that stream through a callback (Fiber) the record is written when the handler returns, before the stream
+ends.
+
+### With `logging`
+
+Install `logging` outside `accesslog` (before it in `UseMiddleware`). The record is then written to the root logger of
+`logging` with its enrichers' additions, carries the attributes added with `logging.AddAttrs` and the `trace_id` and
+`span_id`, and the request ID `accesslog` generated is the one the request logger shows. Installed the other way round,
+or alone, each works as if the other were not there (the record has no late attributes and no trace IDs; the handler
+logs have no generated request ID). The two packages do not import each other.
 
 ## recovery
 
@@ -392,6 +460,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
 
+	"github.com/blackbirdworks/huma-middleware/middleware/accesslog"
 	"github.com/blackbirdworks/huma-middleware/middleware/cleanpath"
 	"github.com/blackbirdworks/huma-middleware/middleware/compression"
 	"github.com/blackbirdworks/huma-middleware/middleware/logging"
@@ -413,6 +482,7 @@ func main() {
 	api.UseMiddleware(
 		tracing.New(),
 		logging.New(logging.WithLogger(logger)),
+		accesslog.New(accesslog.WithLogger(logger)),
 		recovery.New(api),
 		compress,
 	)
@@ -427,26 +497,50 @@ func main() {
 
 ### Order
 
-`cleanpath` (outermost, `net/http`) then `tracing`, `logging`, `recovery`, `compression` (huma, outermost first).
+`cleanpath` (outermost, `net/http`) then `tracing`, `logging`, `accesslog`, `recovery`, `compression` (huma, outermost first).
 
 - **cleanpath first**: every later layer, including path based access rules, sees the same cleaned path, so
   `/public/../admin` cannot slip past a rule that matches `/admin`. Requests that never reach huma (404, 405, raw
   `net/http` routes) are cleaned too.
 - **tracing before logging**: the span exists when logging reads the trace and span IDs, and the span covers the whole
   request.
-- **logging before recovery**: the recovered panic is logged with the request attributes, and the access log records the
-  500 that recovery wrote.
+- **logging before accesslog**: the access record carries what the request logger knows (enrichment, `AddAttrs`, trace
+  and span IDs). **accesslog before recovery**: the recovered panic is logged with the request attributes, and the
+  access log records the 500 that recovery wrote.
 - **recovery inside tracing and logging, outside the handlers**: it recovers before the panic crosses them. What each
   combination records:
   - recovery inside tracing (above): recovery marks the span (exception `*recovery.PanicError`), writes the 500, and
     tracing and its metrics see the 500 as a normal response;
   - recovery outside tracing: tracing records the panic on the span first (exception `*tracing.PanicError`, status 500,
     the 500 also in the metrics) and raises it again; recovery logs it and answers; the span is not marked twice;
-  - recovery outside logging: the panic crosses logging, which writes no access log record for that request.
+  - recovery outside accesslog: the panic crosses it, and no access log record is written for that request.
 - **compression innermost**: it wraps the handler's response, and everything outside it sees the final status and the
-  bytes actually sent (the access log counts the compressed size).
-- **authentication**: before `logging` when the log should carry the user, or call `logging.AddAttrs(ctx, ...)` once the
+  bytes actually sent (`accesslog` counts the compressed size).
+- **authentication**: before `logging` when the logs should carry the user, or call `logging.AddAttrs(ctx, ...)` once the
   user is known.
+
+## Upgrading from v0.1.0
+
+`logging` was split: it keeps the request logger, and the access log is the new `accesslog` package. Nothing is
+deprecated, the access log options are gone from `logging`.
+
+| v0.1.0 | Now |
+| --- | --- |
+| `logging.New(opts...)`: logger and access log | `logging.New(...)` and `accesslog.New(...)`, in this order |
+| `logging.Handler(next, opts...)` | `logging.Handler(accesslog.Handler(accessOpts...)(next), logOpts...)` |
+| `WithLogger`, `WithRequestIDHeader` | the same in both packages (`logging`: the `request_id` of its logger; `accesslog`: the record) |
+| `WithEnrichLogs`, `WithRequestEnrichLogs`, `WithoutRequestAttrs`, `FromContext`, `NewContext`, `AddAttrs` | unchanged, in `logging` |
+| `WithFields(Fields)` | `logging.WithFields` for `Method`, `Route`, `OperationID`, `RequestID`, `TraceID`, `SpanID`; `accesslog.WithFields` for the names of the record |
+| `WithLevels`, `Levels`, `DefaultLevels`, `DefaultFields`, `WithClock`, `WithMessage`, `WithHeaders`, `WithRedactedHeaders`, `WithRequestIDGenerator` | the same names in `accesslog` |
+| `WithSkip`, `WithRequestSkip` | the same names in `accesslog` (they skip the record) |
+| `WithAccessAttrs(func(Record) []slog.Attr)` | `accesslog.WithAttrs(func(*Record) []slog.Attr)` |
+| `WithAccessLogFunc(func(ctx, *slog.Logger, Record))` | `accesslog.WithRecordFunc(func(ctx, *slog.Logger, *Record))`: the `*Record` is pooled, copy what you keep |
+| `WithoutAccessLog` | do not install `accesslog` |
+| `logging.Record` | `accesslog.Record` (a pointer) |
+
+Behaviour: the access record carries the enrichers' additions, the `AddAttrs` attributes and the trace IDs only when
+`logging` is installed outside `accesslog`. A request ID that `accesslog` generated is shown by the request logger only
+then too. In `compression`, a wildcard (`text/*`, `*/*`) no longer matches `text/event-stream`: only its exact name does.
 
 ## Development
 
