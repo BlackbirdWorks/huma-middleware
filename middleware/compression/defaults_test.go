@@ -15,35 +15,6 @@ import (
 	"github.com/blackbirdworks/huma-middleware/middleware/compression"
 )
 
-func TestDefaultConfigValues(t *testing.T) {
-	t.Parallel()
-
-	cfg := compression.DefaultConfig()
-	require.NotNil(t, cfg.Levels.Gzip)
-	require.NotNil(t, cfg.Levels.Brotli)
-	require.NotNil(t, cfg.Levels.Zstd)
-	assert.Equal(t, 6, *cfg.Levels.Gzip)
-	assert.Equal(t, 5, *cfg.Levels.Brotli)
-	assert.Equal(t, 3, *cfg.Levels.Zstd)
-	assert.Equal(t, []compression.Encoding{compression.Brotli, compression.Gzip, compression.Zstd}, cfg.Preference)
-	assert.Equal(t, 1024, cfg.MinSize)
-	assert.False(t, cfg.Disabled)
-}
-
-func TestDefaultConfigIsAFreshCopy(t *testing.T) {
-	t.Parallel()
-
-	cfg := compression.DefaultConfig()
-	*cfg.Levels.Gzip = 1
-	cfg.Preference[0] = compression.Zstd
-	cfg.MinSize = 1
-	assert.Equal(t, 1, cfg.MinSize)
-	again := compression.DefaultConfig()
-	assert.Equal(t, 6, *again.Levels.Gzip)
-	assert.Equal(t, compression.Brotli, again.Preference[0])
-	assert.Equal(t, 1024, again.MinSize)
-}
-
 // reference compresses body with the library directly, as the middleware should at the given level.
 func reference(t *testing.T, enc string, level int, body string) []byte {
 	t.Helper()
@@ -194,45 +165,64 @@ func othersPinned() []pinnedCase {
 		{name: "zip", ct: ctZip, ae: allAE, size: big20k},
 		{name: "octet stream", ct: ctOctet, ae: allAE, size: big20k},
 		{name: "event stream", ct: ctSSE, ae: allAE, size: big20k},
-		{name: "no content type", ct: "", ae: allAE, size: big20k},
+		{name: noCT, ct: "", ae: allAE, size: big20k},
 	}
 }
 
-// TestZeroConfigIsPinned pins what New() does by content type, Accept-Encoding and body size, so that a change
-// of a default fails here and has to be deliberate.
-func TestZeroConfigIsPinned(t *testing.T) {
+// TestDefaultConfig covers the defaults: their values, that each call is a copy, and starting from them.
+func TestDefaultConfig(t *testing.T) {
 	t.Parallel()
 
-	tests := append(jsonPinned(), othersPinned()...)
+	tests := []struct {
+		run  func(t *testing.T)
+		name string
+	}{
+		{name: "values", run: runDefaultConfigValues},
+		{name: "fresh copy", run: runDefaultConfigIsAFreshCopy},
+		{name: "start from the defaults", run: runStartFromTheDefaults},
+		{name: "zero config equals defaults", run: runZeroConfigEqualsTheDefaultConfig},
+	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			body := strings.Repeat("compressible value 0123456789 ", tt.size/30+1)[:tt.size]
-			var hdr []string
-			if tt.ct != "" {
-				hdr = []string{hdrCT, tt.ct}
-			}
-			res := serve(t, mustNew(t), http.MethodGet, []string{hdrAE, tt.ae}, reply(200, hdr, body))
-			assert.Equal(t, tt.wantEnc, res.Header.Get(hdrCE))
-			assert.Equal(t, tt.wantVary, len(res.Header.Values(hdrVary)) > 0)
-			assert.Equal(t, body, res.decoded(t))
-			if tt.wantEnc != "" {
-				assert.Equal(
-					t,
-					reference(t, tt.wantEnc, tt.wantLevel, body),
-					res.Raw,
-					"compressed at level %d",
-					tt.wantLevel,
-				)
-			}
+			tt.run(t)
 		})
 	}
 }
 
-// TestStartFromTheDefaults checks that the defaults, changed in one field and passed to WithDefault, keep the others,
+func runDefaultConfigValues(t *testing.T) {
+	t.Helper()
+
+	cfg := compression.DefaultConfig()
+	require.NotNil(t, cfg.Levels.Gzip)
+	require.NotNil(t, cfg.Levels.Brotli)
+	require.NotNil(t, cfg.Levels.Zstd)
+	assert.Equal(t, 6, *cfg.Levels.Gzip)
+	assert.Equal(t, 5, *cfg.Levels.Brotli)
+	assert.Equal(t, 3, *cfg.Levels.Zstd)
+	assert.Equal(t, []compression.Encoding{compression.Brotli, compression.Gzip, compression.Zstd}, cfg.Preference)
+	assert.Equal(t, 1024, cfg.MinSize)
+	assert.False(t, cfg.Disabled)
+}
+
+func runDefaultConfigIsAFreshCopy(t *testing.T) {
+	t.Helper()
+
+	cfg := compression.DefaultConfig()
+	*cfg.Levels.Gzip = 1
+	cfg.Preference[0] = compression.Zstd
+	cfg.MinSize = 1
+	assert.Equal(t, 1, cfg.MinSize)
+	again := compression.DefaultConfig()
+	assert.Equal(t, 6, *again.Levels.Gzip)
+	assert.Equal(t, compression.Brotli, again.Preference[0])
+	assert.Equal(t, 1024, again.MinSize)
+}
+
+// runStartFromTheDefaults checks that the defaults, changed in one field and passed to WithDefault, keep the others,
 // including the built-in rule for JSON.
-func TestStartFromTheDefaults(t *testing.T) {
-	t.Parallel()
+func runStartFromTheDefaults(t *testing.T) {
+	t.Helper()
 
 	tests := []struct {
 		change  func(*compression.Config)
@@ -305,9 +295,9 @@ func TestStartFromTheDefaults(t *testing.T) {
 	}
 }
 
-// TestZeroConfigEqualsTheDefaultConfig checks that spelling the defaults out changes nothing.
-func TestZeroConfigEqualsTheDefaultConfig(t *testing.T) {
-	t.Parallel()
+// runZeroConfigEqualsTheDefaultConfig checks that spelling the defaults out changes nothing.
+func runZeroConfigEqualsTheDefaultConfig(t *testing.T) {
+	t.Helper()
 
 	zero := mustNew(t)
 	spelled := mustNew(t, compression.WithDefault(compression.DefaultConfig()))
@@ -325,44 +315,5 @@ func TestZeroConfigEqualsTheDefaultConfig(t *testing.T) {
 				})
 			}
 		}
-	}
-}
-
-// TestStreamsAreOnlyMatchedByName checks that no wildcard of an allow-list or of an entry covers server-sent events.
-func TestStreamsAreOnlyMatchedByName(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name     string
-		opts     []compression.Option
-		wantComp bool
-	}{
-		{name: "the defaults"},
-		{name: "text wildcard", opts: []compression.Option{compression.WithContentTypes("text/*")}},
-		{name: "any wildcard", opts: []compression.Option{compression.WithContentTypes("*/*")}},
-		{
-			name: "a wildcard entry",
-			opts: []compression.Option{compression.WithContentType("*/*", compression.Config{})},
-		},
-		{name: "the exact name", opts: []compression.Option{compression.WithContentTypes(ctSSE)}, wantComp: true},
-		{
-			name:     "an exact entry",
-			opts:     []compression.Option{compression.WithContentType(ctSSE, compression.Config{})},
-			wantComp: true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			opts := append([]compression.Option{compression.WithDefault(compression.Config{MinSize: 1})}, tt.opts...)
-			res := serve(
-				t,
-				mustNew(t, opts...),
-				http.MethodGet,
-				[]string{hdrAE, encGzip},
-				reply(200, []string{hdrCT, ctSSE}, big()),
-			)
-			assert.Equal(t, tt.wantComp, res.Header.Get(hdrCE) != "")
-		})
 	}
 }

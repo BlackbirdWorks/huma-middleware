@@ -15,9 +15,9 @@ import (
 
 type discardWriter struct{ h http.Header }
 
-func (w discardWriter) Header() http.Header       { return w.h }
-func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
-func (discardWriter) WriteHeader(int)             {}
+func (w *discardWriter) Header() http.Header       { return w.h }
+func (*discardWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (*discardWriter) WriteHeader(int)             {}
 
 func benchHandler(mw ...func(huma.Context, func(huma.Context))) http.Handler {
 	mux := http.NewServeMux()
@@ -39,7 +39,7 @@ func runBench(b *testing.B, h http.Handler, ae string) {
 	b.Helper()
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, pathList, http.NoBody)
 	req.Header.Set("Accept-Encoding", ae)
-	w := discardWriter{h: http.Header{}}
+	w := &discardWriter{h: http.Header{}}
 	b.ReportAllocs()
 	for b.Loop() {
 		clear(w.h)
@@ -75,4 +75,16 @@ func BenchmarkPerContentTypeConfig(b *testing.B) {
 	)
 	require.NoError(b, err)
 	runBench(b, benchHandler(mw), "gzip")
+}
+
+func BenchmarkNegotiate(b *testing.B) {
+	prefs := []compression.Encoding{compression.Zstd, compression.Brotli, compression.Gzip}
+	for _, h := range []string{encGzip, "gzip, br, zstd", "br;q=0.5, gzip;q=0.8, zstd;q=0.2, *;q=0.1", "identity", ""} {
+		b.Run(h, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				compression.Negotiate(h, prefs)
+			}
+		})
+	}
 }
