@@ -1,7 +1,9 @@
 package tracing_test
 
 import (
+	"bytes"
 	"context"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -486,4 +488,36 @@ func TestGlobalPropagatorRegisteredAfterConstruction(t *testing.T) { //nolint:pa
 			assert.Equal(t, "4bf92f3577b34da6a3ce929d0e0e4736", spans[0].SpanContext.TraceID().String())
 		})
 	}
+}
+
+// TestHandlerGivesBackWhatItsCopyLearned checks the multipart form and the routing pattern of otelhttp's copy.
+func TestHandlerGivesBackWhatItsCopyLearned(t *testing.T) {
+	t.Parallel()
+
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	fw, err := mw.CreateFormFile("file", "a.txt")
+	require.NoError(t, err)
+	_, err = fw.Write([]byte("hello"))
+	require.NoError(t, err)
+	require.NoError(t, mw.Close())
+
+	exp := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
+	var seen *http.Request
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /upload/{id}", func(w http.ResponseWriter, r *http.Request) {
+		seen = r
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		assert.NoError(t, r.ParseMultipartForm(1)) //nolint:gosec // G120: the test body is a few bytes
+	})
+	h := tracing.Handler(mux, tracing.WithTracerProvider(tp))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/upload/7", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	require.NotNil(t, seen)
+	require.NotNil(t, req.MultipartForm)
+	assert.Same(t, seen.MultipartForm, req.MultipartForm)
+	assert.Equal(t, "POST /upload/{id}", req.Pattern)
 }

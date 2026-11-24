@@ -21,6 +21,11 @@
 //
 // # Limits
 //
+// With [Handler], a panicking request is recorded on its span but is missing
+// from the HTTP server metrics: reporting the 500 to otelhttp would mean writing
+// it to the client before a recovery middleware decides on the response. [New]
+// reports it, because its response view is not the client's.
+//
 // A huma middleware sees neither the raw request body nor the raw response
 // writer, so compared with otelhttp on a real [http.Handler]:
 //
@@ -111,13 +116,42 @@ func New(opts ...Option) Middleware {
 	if cfg.explicitPropagator {
 		keys = headerKeys(cfg.propagator)
 	}
-	pool := &sync.Pool{New: func() any {
-		c := &call{hdr: make(http.Header, len(keys)), vals: make([][1]string, len(keys)), rhdr: http.Header{}}
-		c.each = c.addHeader
 
-		return c
-	}}
+	return newMiddleware(cfg, keys, newPoolStore(keys))
+}
 
+// viewStore hands out the request views and takes them back.
+type viewStore interface {
+	get() *call
+	put(c *call)
+}
+
+// poolStore keeps the views in a [sync.Pool].
+type poolStore struct {
+	pool sync.Pool
+}
+
+func newPoolStore(keys []string) *poolStore {
+	return &poolStore{pool: sync.Pool{New: func() any { return newCall(keys) }}}
+}
+
+func newCall(keys []string) *call {
+	c := &call{hdr: make(http.Header, len(keys)), vals: make([][1]string, len(keys)), rhdr: http.Header{}}
+	c.each = c.addHeader
+
+	return c
+}
+
+func (p *poolStore) get() *call {
+	c, _ := p.pool.Get().(*call)
+
+	return c
+}
+
+func (p *poolStore) put(c *call) { p.pool.Put(c) }
+
+// newMiddleware builds the huma middleware around a store of views.
+func newMiddleware(cfg *config, keys []string, store viewStore) Middleware {
 	inner := otelhttp.NewHandler(http.HandlerFunc(serveCall), operationName, cfg.otelOptions(false)...)
 
 	return func(hctx huma.Context, next func(huma.Context)) {
@@ -128,10 +162,10 @@ func New(opts ...Option) Middleware {
 			return
 		}
 
-		c := pool.Get().(*call) //nolint:errcheck // the pool only holds *call
+		c := store.get()
 		defer func() {
 			c.reset()
-			pool.Put(c)
+			store.put(c)
 		}()
 		c.fill(hctx, next, route, keys)
 
@@ -216,7 +250,31 @@ func Handler(next http.Handler, opts ...Option) http.Handler {
 		return next
 	}
 
-	return otelhttp.NewHandler(recordingHandler(next, cfg.nameFormatter), operationName, cfg.otelOptions(true)...)
+	inner := otelhttp.NewHandler(recordingHandler(next, cfg.nameFormatter), operationName, cfg.otelOptions(true)...)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// otelhttp serves a copy of the request, on which the router sets the pattern and a handler
+		// parses the multipart form: give both back to the request this handler received, so the
+		// wrappers around it (and net/http, for the upload files) see them.
+		h := &routeHolder{}
+		r2 := r.WithContext(context.WithValue(r.Context(), routeKey{}, h))
+		defer func() {
+			if r2.MultipartForm != nil {
+				r.MultipartForm = r2.MultipartForm
+			}
+			if h.pattern != "" {
+				r.Pattern = h.pattern
+			}
+		}()
+		inner.ServeHTTP(w, r2)
+	})
+}
+
+type routeKey struct{}
+
+// routeHolder carries the routing pattern out of the request copy of otelhttp.
+type routeHolder struct {
+	pattern string
 }
 
 // setRoute sets http.route on the span from the pattern the router matched: the method and
@@ -242,6 +300,11 @@ func recordingHandler(next http.Handler, formatter func(method, route string) st
 		// The mux sets r.Pattern on this request while routing, after the span started: put the
 		// route on the span too (otelhttp only uses it for the span name and the metrics).
 		defer setRoute(trace.SpanFromContext(r.Context()), r, formatter)
+		defer func() {
+			// Only Handler builds this handler, and it always puts the holder in the context.
+			h, _ := r.Context().Value(routeKey{}).(*routeHolder)
+			h.pattern = r.Pattern
+		}()
 		defer func() {
 			if v := recover(); v != nil {
 				if !isAbort(v) {
