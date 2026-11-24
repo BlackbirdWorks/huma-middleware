@@ -316,6 +316,9 @@ func isClean(p string, ts TrailingSlash) bool {
 	if p == "/" {
 		return true
 	}
+	if p[1] == '/' || p[1] == '\\' { // "//" and "/\" are scheme-relative: never a clean path
+		return false
+	}
 	trailing := p[len(p)-1] == '/'
 	if (ts == StripSlash && trailing) || (ts == AddSlash && !trailing) {
 		return false

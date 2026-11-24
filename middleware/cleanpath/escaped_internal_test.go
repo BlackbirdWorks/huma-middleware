@@ -107,3 +107,29 @@ func TestRedirect(t *testing.T) {
 		})
 	}
 }
+
+// TestIsClean covers the paths that start like a scheme-relative URL: never clean. It is internal because an escaped
+// path never holds a backslash, so only a direct call reaches that row.
+func TestIsClean(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{name: "root", path: "/", want: true},
+		{name: "path", path: "/a/b", want: true},
+		{name: "empty", path: ""},
+		{name: "relative", path: "a"},
+		{name: "double slash", path: "//evil.example"},
+		{name: "slash backslash", path: "/\\evil.example"},
+		{name: "encoded backslash", path: "/%5Cevil.example", want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, isClean(tt.path, KeepSlash))
+		})
+	}
+}
