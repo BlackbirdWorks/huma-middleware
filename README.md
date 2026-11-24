@@ -188,7 +188,8 @@ Options: `WithLogger` (nil or absent means `slog.Default()`, resolved on every r
 `WithHeaders(names...)` with `WithRedactedHeaders(names...)` (Authorization, cookies and API key headers are redacted by
 default), `WithRequestIDHeader(name)` (the request's ID, else the same header of the response when the record is
 written) and `WithRequestIDGenerator(fn)` (creates the ID when the request has none and sets it on the response), and
-`WithRecordFunc(fn)`, which replaces the record entirely with your own function, for applications that must keep an
+`WithRetainedRecords` (for a log handler that keeps the record after `Handle` returns, as an asynchronous one does: the
+attribute slices are allocated per record instead of pooled), and `WithRecordFunc(fn)`, which replaces the record entirely with your own function, for applications that must keep an
 existing log format:
 
 <!-- example: accesslog ExampleWithRecordFunc -->
@@ -231,7 +232,9 @@ Install `logging` outside `accesslog` (before it in `UseMiddleware`). The record
 `logging` with its enrichers' additions, carries the attributes added with `logging.AddAttrs` and the `trace_id` and
 `span_id`, and the request ID `accesslog` generated is the one the request logger shows. Installed the other way round,
 or alone, each works as if the other were not there (the record has no late attributes and no trace IDs; the handler
-logs have no generated request ID). The two packages do not import each other.
+logs have no generated request ID). The request logger learns an ID that `accesslog` generated when the handler runs,
+so a logger an enricher grouped with `WithGroup` (its request attributes are bound at that point) does not show it, and
+it does not see a response header a handler sets; the access record does. The two packages do not import each other.
 
 ## recovery
 
@@ -557,9 +560,9 @@ allocation columns are exact.
 | `compression/gzip-20k` | 53.32 µs | 53.06 µs | -0% | 11 | 7 | 771 | 497 |
 | `compression/brotli-20k` | 28.20 µs | 30.95 µs | +10% | 11 | 7 | 686 | 430 |
 | `compression/zstd-20k` | 11.10 µs | 10.90 µs | -2% | 11 | 7 | 559 | 284 |
-| `compression/stream-gzip` | 28.71 µs | 28.39 µs | -1% | 11 | 7 | 590 | 317 |
-| `compression/stream-passthrough` | 906 ns | 787 ns | -13% | 7 | 6 | 352 | 128 |
-| `bare/stream` | 451 ns | 460 ns | +2% | 5 | 5 | 112 | 112 |
+| `compression/stream-gzip` | 28.87 µs | 28.28 µs | -2% | 11 | 7 | 602 | 326 |
+| `compression/stream-passthrough` | 905 ns | 757 ns | -16% | 7 | 6 | 352 | 128 |
+| `bare/stream` | 456 ns | 467 ns | +2% | 5 | 5 | 112 | 112 |
 | `cleanpath/clean` | 468 ns | 501 ns | +7% | 5 | 5 | 144 | 144 |
 | `cleanpath/encoded-clean` | 618 ns | 621 ns | +1% | 8 | 7 | 168 | 160 |
 | `cleanpath/rewrite` | 860 ns | 769 ns | -11% | 9 | 7 | 664 | 600 |
@@ -606,7 +609,7 @@ deprecated, the access log options are gone from `logging`.
 
 Behaviour: the access record carries the enrichers' additions, the `AddAttrs` attributes and the trace IDs only when
 `logging` is installed outside `accesslog`. A request ID that `accesslog` generated is shown by the request logger only
-then too. In `compression`, a wildcard (`text/*`, `*/*`) no longer matches `text/event-stream`: only its exact name does.
+then too, and the request logger no longer follows a response header that a handler sets (the access record does). In `compression`, a wildcard (`text/*`, `*/*`) no longer matches `text/event-stream`: only its exact name does.
 
 ## Development
 

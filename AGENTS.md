@@ -17,11 +17,13 @@ Reusable, router-agnostic middleware for [huma v2](https://github.com/danielgtay
   non-test code (`depguard` enforces it). A middleware must behave the same under every adapter.
 - Plain `http.Handler` variants (`tracing.Handler`, `logging.Handler`) are allowed only as thin layers over the same core
   and import `net/http` only.
-- Dependency isolation: `logging` and `recovery` use the OpenTelemetry API only, `accesslog` has no OpenTelemetry import (it reads trace IDs through `internal/reqlog`, the one thing it shares with `logging`) (no SDK, no contrib); `tracing` has no
-  compression library; `compression` and `cleanpath` have no OpenTelemetry. `depguard` enforces it. Ask before adding a dependency.
+- Dependency isolation: `logging` and `recovery` use the OpenTelemetry API only (no SDK, no contrib); `accesslog` has
+  no OpenTelemetry import at all (it gets trace IDs through `internal/reqlog`, the one thing it shares with `logging`);
+  `tracing` has no compression library; `compression` and `cleanpath` have no OpenTelemetry. `depguard` enforces it.
+  Ask before adding a dependency.
 - Functional options, zero-config defaults. No `init()`, no package-level mutable state, no singletons
   (`gochecknoglobals`, `gochecknoinits`, `reassign`). The one permitted global is `slog.Default()`, resolved only where
-  no logger was given: in `logging` on every request, in `tracing` once at construction for its one "tracing disabled"
+  no logger was given: in `logging` and `accesslog` on every request, in `tracing` once at construction for its one "tracing disabled"
   line, and in `recovery` through `logging.FromContext` when it has no logger of its own. A nil logger always means
   `slog.Default()`; nothing else reads a global logger.
 - Log with `log/slog` and typed attributes (`LogAttrs`, `slog.String`, ...); never key/value pairs (`sloglint`).
