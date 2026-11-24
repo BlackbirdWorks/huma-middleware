@@ -4,12 +4,14 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/danielgtaylor/huma/v2"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/blackbirdworks/huma-middleware/internal/bodywriter"
 )
 
 type stateKey struct{}
@@ -221,40 +223,19 @@ func (s *state) lateAttrs() []slog.Attr {
 	return append([]slog.Attr(nil), s.late...)
 }
 
-// counter counts the bytes written to the response body.
+// counter counts the bytes written to the response body. Adapters that stream
+// through a callback write from another goroutine, so the count is atomic.
 type counter struct {
-	w io.Writer
-	n int64
+	bodywriter.Passthrough
+
+	n atomic.Int64
 }
 
 func (c *counter) Write(p []byte) (int, error) {
-	n, err := c.w.Write(p)
-	c.n += int64(n)
+	n, err := c.W.Write(p)
+	c.n.Add(int64(n))
 
 	return n, err //nolint:wrapcheck // transparent pass-through of the response writer error
-}
-
-// Flush forwards to the underlying writer so streaming keeps working.
-func (c *counter) Flush() { _ = c.FlushError() }
-
-// FlushError flushes the underlying writer and returns what it reports, for
-// [http.ResponseController].
-func (c *counter) FlushError() error {
-	switch w := c.w.(type) {
-	case http.ResponseWriter:
-		return http.NewResponseController(w).Flush() //nolint:wrapcheck // the writer's own error
-	case http.Flusher:
-		w.Flush()
-	}
-
-	return nil
-}
-
-// Unwrap exposes the underlying writer to [http.ResponseController].
-func (c *counter) Unwrap() http.ResponseWriter {
-	rw, _ := c.w.(http.ResponseWriter)
-
-	return rw
 }
 
 // wrapper is the huma.Context given to the rest of the chain: it carries the
@@ -306,7 +287,7 @@ func (w *wrapper) StreamBody(fn func(io.Writer)) {
 		return
 	}
 	bs.StreamBody(func(sink io.Writer) {
-		w.st.counter.w = sink
+		w.st.counter.W = sink
 		fn(&w.st.counter)
 	})
 }

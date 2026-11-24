@@ -109,20 +109,22 @@ func New(opts ...Option) Middleware {
 		if cfg.requestID != "" {
 			reqID = hctx.Header(cfg.requestID)
 		}
-		if reqID == "" && cfg.requestID != "" && cfg.idGen != nil {
-			reqID = cfg.idGen()
-			hctx.SetHeader(cfg.requestID, reqID)
-		}
 		start := cfg.clock()
 		st := newState(cfg, cfg.root(), hctx.Method(), route, opID, reqID, trace.SpanContextFromContext(hctx.Context()))
 		st.idHeader = cfg.requestID
+		if reqID == "" && cfg.requestID != "" && cfg.idGen != nil {
+			// A generated ID lives on the response: what the handlers leave there is what is logged.
+			id := cfg.idGen()
+			hctx.SetHeader(cfg.requestID, id)
+			st.trackHeader(cfg.requestID, id)
+		}
 		for _, fn := range cfg.enrich {
 			if l := fn(hctx, st.logger); l != nil {
 				st.logger = st.adopt(cfg, l)
 			}
 		}
 		ctx := context.WithValue(hctx.Context(), stateKey{}, st)
-		st.counter.w = hctx.BodyWriter()
+		st.counter.W = hctx.BodyWriter()
 		st.hwrap = wrapper{base: hctx, ctx: ctx, st: st}
 
 		next(&st.hwrap)
@@ -141,7 +143,7 @@ func New(opts ...Option) Middleware {
 			UserAgent:   hctx.Header("User-Agent"),
 			RequestID:   st.resolvedID(),
 			Duration:    cfg.clock().Sub(start),
-			Size:        st.counter.n,
+			Size:        st.counter.n.Load(),
 			Status:      statusOf(hctx.Status()),
 			hctx:        hctx,
 		})
@@ -165,21 +167,23 @@ func statusOf(s int) int {
 // Handler wraps a plain [http.Handler] with the same request logger and access
 // log, for routes that bypass huma. The route is the [http.Request] Pattern
 // set by [http.ServeMux] after routing, so it is only available to the access
-// log record; the operation ID is empty.
+// log record; the operation ID is empty. The pattern and the parsed multipart
+// form of the request the handler received are copied back to the request this
+// handler received, so wrappers around it (and net/http, which removes the
+// temporary files of uploads) see them.
+//
+// The request ID is the request header; failing that the response header
+// (an ID an outer wrapper set), and the generator of [WithRequestIDGenerator]
+// last. The access log reports the response header as it is when the record is
+// written.
 func Handler(next http.Handler, opts ...Option) http.Handler {
 	cfg := newConfig(opts)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var reqID string
-		if cfg.requestID != "" {
-			reqID = r.Header.Get(cfg.requestID)
-		}
-		if reqID == "" && cfg.requestID != "" && cfg.idGen != nil {
-			reqID = cfg.idGen()
-			w.Header().Set(cfg.requestID, reqID)
-		}
+		reqID, respID := requestIDs(cfg, r, w)
 		start := cfg.clock()
 		st := newState(cfg, cfg.root(), r.Method, "", "", reqID, trace.SpanContextFromContext(r.Context()))
+		st.respID = respID
 		for _, fn := range cfg.reqEnrich {
 			if l := fn(r, st.logger); l != nil {
 				st.logger = st.adopt(cfg, l)
@@ -187,9 +191,14 @@ func Handler(next http.Handler, opts ...Option) http.Handler {
 		}
 		ctx := context.WithValue(r.Context(), stateKey{}, st)
 		rw := &respWriter{ResponseWriter: w}
+		var out http.ResponseWriter = rw
+		if _, ok := w.(http.Hijacker); ok {
+			out = hijackWriter{rw}
+		}
 
 		rr := r.WithContext(ctx)
-		next.ServeHTTP(rw, rr)
+		defer giveBack(r, rr)
+		next.ServeHTTP(out, rr)
 
 		if cfg.noAccess || (cfg.reqSkip != nil && cfg.reqSkip(r)) {
 			return
@@ -213,6 +222,36 @@ func Handler(next http.Handler, opts ...Option) http.Handler {
 			req:        r,
 		})
 	})
+}
+
+// requestIDs resolves the request ID of a plain handler: the request header; failing that
+// the response header (an ID an outer wrapper set); failing that the generated one, which
+// is set on the response. reqID is the request's, respID the one found or made on the response.
+func requestIDs(cfg *config, r *http.Request, w http.ResponseWriter) (string, string) {
+	if cfg.requestID == "" {
+		return "", ""
+	}
+	if reqID := r.Header.Get(cfg.requestID); reqID != "" {
+		return reqID, ""
+	}
+	respID := w.Header().Get(cfg.requestID)
+	if respID == "" && cfg.idGen != nil {
+		respID = cfg.idGen()
+		w.Header().Set(cfg.requestID, respID)
+	}
+
+	return "", respID
+}
+
+// giveBack hands the multipart form (whose temporary files net/http removes through the original request) and
+// the routing pattern that the copy of a request learned to the request it was made from.
+func giveBack(r, cp *http.Request) {
+	if cp.MultipartForm != nil {
+		r.MultipartForm = cp.MultipartForm
+	}
+	if cp.Pattern != "" {
+		r.Pattern = cp.Pattern
+	}
 }
 
 // routePart strips the optional "METHOD " prefix of a [http.ServeMux] pattern.
@@ -266,8 +305,15 @@ func (w *respWriter) FlushError() error {
 	return err //nolint:wrapcheck // the writer's own error
 }
 
-// Hijack lets handlers take over the connection (upgrades) when the underlying writer allows it.
-func (w *respWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+// hijackWriter is the writer given to handlers when the underlying writer is an
+// [http.Hijacker], so that a direct w.(http.Hijacker) assertion succeeds exactly
+// when it would have on the underlying writer.
+type hijackWriter struct {
+	*respWriter
+}
+
+// Hijack lets handlers take over the connection (upgrades).
+func (w hijackWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return http.NewResponseController(w.ResponseWriter).Hijack() //nolint:wrapcheck // the writer's own error
 }
 

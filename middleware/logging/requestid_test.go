@@ -22,6 +22,8 @@ const (
 	idFromResponse = "from-response"
 	idLower        = "lower"
 	idTrace        = "t-1"
+	idOuter        = "outer-1"
+	idInner        = "inner-1"
 )
 
 type idCase struct {
