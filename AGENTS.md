@@ -20,8 +20,10 @@ Reusable, router-agnostic middleware for [huma v2](https://github.com/danielgtay
 - Dependency isolation: `logging` and `recovery` use the OpenTelemetry API only (no SDK, no contrib); `tracing` has no
   compression library; `compression` and `cleanpath` have no OpenTelemetry. `depguard` enforces it. Ask before adding a dependency.
 - Functional options, zero-config defaults. No `init()`, no package-level mutable state, no singletons
-  (`gochecknoglobals`, `gochecknoinits`, `reassign`). The one permitted use of a global is `slog.Default()` in
-  `logging`, resolved per request when no logger was given.
+  (`gochecknoglobals`, `gochecknoinits`, `reassign`). The one permitted global is `slog.Default()`, resolved only where
+  no logger was given: in `logging` on every request, in `tracing` once at construction for its one "tracing disabled"
+  line, and in `recovery` through `logging.FromContext` when it has no logger of its own. A nil logger always means
+  `slog.Default()`; nothing else reads a global logger.
 - Log with `log/slog` and typed attributes (`LogAttrs`, `slog.String`, ...); never key/value pairs (`sloglint`).
   No `zap`, no `echo`, no stdlib `log`.
 - Hot path: no `fmt`, no maps, no allocation that is not needed; benchmark with `task bench` before and after.
@@ -31,9 +33,10 @@ Reusable, router-agnostic middleware for [huma v2](https://github.com/danielgtay
 
 - Table-driven and parallel: one `tests := []struct{ name string; ... }` per behaviour, `t.Parallel()` at the top of every
   test and every subtest, each case builds its own API, recorder and exporter. No copy-pasted near-identical tests.
-- The only non-parallel tests are those that call `slog.SetDefault` (process-wide) and those that assert allocations with
-  `testing.AllocsPerRun` (it panics in parallel tests and would count other goroutines); each says so in a comment and
-  carries a reasoned `//nolint:paralleltest`. `slog.SetDefault` is restored with `t.Cleanup`.
+- The only non-parallel tests are those that change process-wide state (`slog.SetDefault`, the global OpenTelemetry
+  propagator) and those that assert allocations with `testing.AllocsPerRun` (it panics in parallel tests and would count
+  other goroutines); each says so in a comment and carries a reasoned `//nolint:paralleltest`. The global is restored
+  with `t.Cleanup`. Reuse of pooled objects is not tested through a `sync.Pool` (it may drop items): inject the store.
 - `testify` only: `require` stops the test, `assert` continues; `t.Fatal*`/`t.Error*` are forbidden (lint).
 - Black-box tests in `package x_test`; white-box tests live in `*_internal_test.go` and only when unavoidable.
   Never add `export_test.go`.

@@ -152,9 +152,10 @@ the access log. `logging.Handler(next, opts...)` is the form for plain routes.
 Options: `WithLogger` (nil or absent means `slog.Default()`, resolved on every request), `WithFields` (rename
 attributes), `WithLevels`, `WithClock`, `WithMessage`, `WithSkip(fn)` (skips the access log), `WithoutAccessLog`,
 `WithAccessAttrs(fn)`, `WithHeaders(names...)` with `WithRedactedHeaders(names...)` (Authorization, cookies and API key
-headers are redacted by default), `WithRequestIDHeader(name)` (the request's ID, else the same header of the response
-when the record is written; `Record.RequestID` is the resolved one), `WithRequestIDGenerator(fn)` (creates the ID, sets it
-on the response and the logger, when neither side has one), `WithoutRequestAttrs`, `WithEnrichLogs(fn)` (called once per
+headers are redacted by default), `WithRequestIDHeader(name)` (the request's ID, else the same header of the response: an ID an outer wrapper set,
+then the one on the response when the record is written; `Record.RequestID` is the resolved one),
+`WithRequestIDGenerator(fn)` (creates the ID last, when neither side has one, and sets it on the response; the huma form
+cannot see a header an outer middleware set earlier), `WithoutRequestAttrs`, `WithEnrichLogs(fn)` (called once per
 request, before the handlers; the returned logger is used for handler logs and the access log; several are applied in
 order; a panic in `fn` propagates) and `WithAccessLogFunc(fn)`, which replaces the access log record entirely with
 your own function and a `Record`, for applications that must keep an existing log format. `Record.Header` and
@@ -192,7 +193,7 @@ func ExampleNew() {
 
 It logs at error level through the request logger (`logging.FromContext`, so the record carries the request attributes)
 with the panic value and the stack, marks the active span as error if one is still recording (OpenTelemetry API only),
-and, if nothing was written yet, answers 500 in huma's error model (`huma.WriteErr`), or with your `WithHandler`.
+and, if nothing was written yet (a final status, a body write or a flush counts as written; an early hint does not), answers 500 in huma's error model (`huma.WriteErr`), or with your `WithHandler`; with a nil `api` and no handler it answers a plain text 500.
 `http.ErrAbortHandler` is raised again, not swallowed. Options: `WithLogger`, `WithStack(bool)`, `WithStackSize(n)`,
 `WithHandler`, `WithSkip`; `recovery.Handler(opts...)` is the `net/http` form (`WithRequestHandler`, `WithRequestSkip`).
 
@@ -208,7 +209,7 @@ func ExampleNew() {
 		compression.WithDefault(compression.Config{MinSize: 1}), // compress even tiny bodies here
 		compression.WithContentType("text/html", compression.Config{
 			Preference: []compression.Encoding{compression.Gzip, compression.Brotli},
-			Levels:     compression.Levels{Gzip: 9},
+			Levels:     compression.Levels{Gzip: new(9)},
 		}),
 		compression.WithSkipPathPrefixes("/metrics"),
 	)
@@ -231,10 +232,10 @@ func ExampleNew() {
 
 Defaults: zstd for JSON (`application/json`, `+json`) when the client accepts it, otherwise brotli, then gzip (zstd is the
 last resort for other types). The client's quality values come first (`q=0` excludes, `*` and `identity` are
-understood); the server preference breaks ties.
+understood; a header split over several lines is read as one list); the server preference breaks ties.
 
 Configuration is one default `Config` (`WithDefault`) plus optional per-content-type configs (`WithContentType`). A
-`Config` has `Preference` (order), `Levels` (`compression.Levels{Gzip, Brotli, Zstd}`: gzip -2 to 9, brotli 1 to 11, zstd 1 to 22; zero keeps the default), `MinSize`
+`Config` has `Preference` (order), `Levels` (`compression.Levels{Gzip, Brotli, Zstd}`, each a pointer written with `new(n)`, so that level 0 is selectable: gzip -2 to 9, brotli 0 to 11, zstd 1 to 22; nil keeps the default), `MinSize`
 (default 1024) and `Disabled`; a content type's config inherits what it leaves at the zero value. The entry for a
 response is the most specific match: exact (`application/json`), then suffix (`+json`, the longest), then wildcard
 (`text/*`, the longest; `*/*` last), then the default. An entry also makes its type compressible. Encoder pools are keyed
