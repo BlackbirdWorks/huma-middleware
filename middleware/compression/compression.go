@@ -146,6 +146,7 @@ type compressor struct {
 	exact     map[string]*settings
 	pools     map[poolKey]*encoderPool
 	allow     []string
+	respPool  sync.Pool
 	suffixes  []patternSettings
 	wildcards []patternSettings
 }
@@ -214,6 +215,12 @@ func New(opts ...Option) (Middleware, error) {
 				c.pools[key] = newEncoderPool(e, key.level)
 			}
 		}
+	}
+	c.respPool.New = func() any {
+		r := &response{c: c}
+		r.collect = r.collectAccept
+
+		return r
 	}
 	c.bufPool.New = func() any {
 		b := make([]byte, 0, maxMin)
@@ -297,25 +304,34 @@ func globMatch(pattern, name string) bool {
 	return ok
 }
 
-// acceptEncoding returns the Accept-Encoding of the request with all its field
-// lines joined: they are one comma-separated list, but Header returns the first.
-func acceptEncoding(ctx huma.Context) string {
-	first := ctx.Header("Accept-Encoding")
-	if first == "" {
-		return ""
-	}
-	joined := first
-	count := 0
-	ctx.EachHeader(func(name, value string) {
-		if strings.EqualFold(name, "Accept-Encoding") {
-			count++
-			if count > 1 {
-				joined += ", " + value
-			}
-		}
-	})
+// acquire returns a response for the request, from the pool: it is reset here, not when released, so that a
+// late write by a handler that kept the writer finds the finished state until the object is reused.
+func (c *compressor) acquire(ctx huma.Context) *response {
+	r, _ := c.respPool.Get().(*response)
+	*r = response{c: c, collect: r.collect, base: ctx, sink: ctx.BodyWriter(), method: ctx.Method()}
 
-	return joined
+	return r
+}
+
+// acceptEncoding returns the Accept-Encoding of the request, read when it is needed: most responses that are
+// not compressed never ask. The field lines are one comma-separated list, but Header returns the first.
+func (r *response) acceptEncoding() string {
+	r.accept = r.base.Header("Accept-Encoding")
+	if r.accept != "" {
+		r.base.EachHeader(r.collect)
+	}
+
+	return r.accept
+}
+
+// collectAccept joins the Accept-Encoding field lines after the first one.
+func (r *response) collectAccept(name, value string) {
+	if len(name) == len("Accept-Encoding") && strings.EqualFold(name, "Accept-Encoding") {
+		r.acceptLines++
+		if r.acceptLines > 1 {
+			r.accept += ", " + value
+		}
+	}
 }
 
 func (c *compressor) handle(ctx huma.Context, next func(huma.Context)) {
@@ -324,24 +340,20 @@ func (c *compressor) handle(ctx huma.Context, next func(huma.Context)) {
 
 		return
 	}
-	r := &response{
-		base:   ctx,
-		c:      c,
-		sink:   ctx.BodyWriter(),
-		accept: acceptEncoding(ctx),
-		method: ctx.Method(),
-	}
+	r := c.acquire(ctx)
 	done := false
 	defer func() {
 		if !done {
-			r.abort()
+			r.abort() // a panic: the response is not reused, whatever still holds it
 		}
 	}()
 	next(r)
 	done = true
-	if !r.streaming {
-		r.finish()
+	if r.streaming {
+		return // a stream callback may outlive the handler: the response is not reused
 	}
+	r.finish()
+	c.respPool.Put(r)
 }
 
 type state int
@@ -362,29 +374,30 @@ type base huma.Context
 type response struct {
 	base
 
-	c      *compressor
-	sink   io.Writer
-	enc    encoder
-	pool   *encoderPool
-	bufp   *[]byte
-	method string
-	accept string
-
+	sink io.Writer
+	enc  encoder
+	// collect is collectAccept as a value, made once so that reading the header lines does not allocate.
+	collect         func(name, value string)
+	c               *compressor
+	pool            *encoderPool
+	bufp            *[]byte
 	set             *settings
-	contentType     string
 	contentEncoding string
+	contentLength   string
+	accept          string
+	contentType     string
+	method          string
 	cacheControl    string
 	etag            string
-	contentLength   string
-
-	status     int
-	state      state
-	statusSet  bool
-	hasLength  bool
-	streaming  bool
-	allowed    bool
-	hasETag    bool
-	varyListed bool
+	acceptLines     int
+	status          int
+	state           state
+	statusSet       bool
+	hasLength       bool
+	streaming       bool
+	allowed         bool
+	hasETag         bool
+	varyListed      bool
 }
 
 // SetStatus records the status; it is sent when the body starts.
@@ -421,33 +434,57 @@ func (r *response) AppendHeader(name, value string) {
 }
 
 func (r *response) track(name, value string, replace bool) {
-	switch {
-	case strings.EqualFold(name, "Content-Length"):
-		r.contentLength, r.hasLength = value, true
-
-		return
-	case strings.EqualFold(name, "ETag"):
-		r.etag, r.hasETag = value, true
-
-		return
-	case strings.EqualFold(name, "Content-Type"):
-		r.contentType = value
-	case strings.EqualFold(name, "Content-Encoding"):
-		r.contentEncoding = value
-	case strings.EqualFold(name, "Cache-Control"):
-		if replace || r.cacheControl == "" {
-			r.cacheControl = value
-		} else {
-			r.cacheControl += "," + value
+	// The name lengths tell the headers apart before any comparison: most headers are none of them.
+	held := false
+	switch len(name) {
+	case len("ETag"): // ETag, Vary
+		held = r.trackShort(name, value, replace)
+	case len("Content-Type"):
+		if strings.EqualFold(name, "Content-Type") {
+			r.contentType = value
 		}
-	case strings.EqualFold(name, "Vary"):
-		listed := varyListsAcceptEncoding(value)
-		r.varyListed = listed || (!replace && r.varyListed)
+	case len("Cache-Control"):
+		if strings.EqualFold(name, "Cache-Control") {
+			r.trackCacheControl(value, replace)
+		}
+	case len("Content-Length"):
+		if strings.EqualFold(name, "Content-Length") {
+			r.contentLength, r.hasLength, held = value, true, true
+		}
+	case len("Content-Encoding"):
+		if strings.EqualFold(name, "Content-Encoding") {
+			r.contentEncoding = value
+		}
+	}
+	if held {
+		return
 	}
 	if replace {
 		r.base.SetHeader(name, value)
 	} else {
 		r.base.AppendHeader(name, value)
+	}
+}
+
+// trackShort watches ETag, which is held back, and Vary.
+func (r *response) trackShort(name, value string, replace bool) bool {
+	switch {
+	case strings.EqualFold(name, "ETag"):
+		r.etag, r.hasETag = value, true
+
+		return true
+	case strings.EqualFold(name, "Vary"):
+		r.varyListed = varyListsAcceptEncoding(value) || (!replace && r.varyListed)
+	}
+
+	return false
+}
+
+func (r *response) trackCacheControl(value string, replace bool) {
+	if replace || r.cacheControl == "" {
+		r.cacheControl = value
+	} else {
+		r.cacheControl += "," + value
 	}
 }
 
@@ -638,7 +675,7 @@ func (r *response) plan(size int) (Encoding, bool, bool) {
 	case size == 0 || size < set.minSize:
 		return "", false, true
 	}
-	enc, ok := Negotiate(r.accept, set.pref)
+	enc, ok := Negotiate(r.acceptEncoding(), set.pref)
 
 	return enc, ok, true
 }

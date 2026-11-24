@@ -35,6 +35,9 @@ type accepted struct {
 // items (an unparsable q) are ignored. The result is false when the response
 // should be sent as is.
 func Negotiate(acceptEncoding string, preference []Encoding) (Encoding, bool) {
+	if acceptEncoding == "" {
+		return "", false
+	}
 	a := parseAccept(acceptEncoding)
 	var best Encoding
 	bestQ := 0
@@ -69,7 +72,9 @@ func (a accepted) quality(e Encoding) int {
 
 func parseAccept(h string) accepted {
 	a := accepted{unset, unset, unset, unset}
-	for item := range strings.SplitSeq(h, ",") {
+	for rest := h; rest != ""; {
+		var item string
+		item, rest, _ = strings.Cut(rest, ",")
 		name, params, _ := strings.Cut(item, ";")
 		name = strings.TrimSpace(name)
 		q, ok := parseQ(params)
@@ -101,7 +106,9 @@ func parseAccept(h string) accepted {
 // Accept-Encoding item. No q means 1. ok is false for a malformed value.
 func parseQ(params string) (int, bool) {
 	q := maxQ
-	for p := range strings.SplitSeq(params, ";") {
+	for rest := params; rest != ""; {
+		var p string
+		p, rest, _ = strings.Cut(rest, ";")
 		key, val, found := strings.Cut(p, "=")
 		if !found || !strings.EqualFold(strings.TrimSpace(key), "q") {
 			continue
