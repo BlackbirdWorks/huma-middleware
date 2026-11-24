@@ -21,7 +21,7 @@ func TestNegotiate(t *testing.T) {
 		wantOK bool
 	}{
 		{name: "empty header", header: "", prefs: all},
-		{name: "identity only", header: "identity", prefs: all},
+		{name: "identity only", header: encIdent, prefs: all},
 		{name: "unknown only", header: "deflate, compress", prefs: all},
 		{name: "single gzip", header: encGzip, prefs: all, want: compression.Gzip, wantOK: true},
 		{name: "single br", header: encBrotli, prefs: all, want: compression.Brotli, wantOK: true},

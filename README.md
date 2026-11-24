@@ -199,14 +199,94 @@ and, if nothing was written yet (a final status, a body write or a flush counts 
 
 ## compression
 
-zstd, brotli and gzip, negotiated from `Accept-Encoding`.
+zstd, brotli and gzip, negotiated from `Accept-Encoding`. `compression.New()` with no option is the recommended
+configuration; `compression.WithDefaults()` says so explicitly, and the values can be read.
+
+<!-- example: compression ExampleWithDefaults -->
+```go
+func ExampleWithDefaults() {
+	// compression.New() alone is the recommendation; WithDefaults() says so explicitly.
+	mw, err := compression.New(compression.WithDefaults())
+	if err != nil {
+		panic(err)
+	}
+	_ = mw
+
+	// The values are readable: Recommended, RecommendedContentTypes and RecommendedAllowList.
+	cfg := compression.Recommended()
+	fmt.Println(cfg.Preference, *cfg.Levels.Gzip, *cfg.Levels.Brotli, *cfg.Levels.Zstd, cfg.MinSize)
+	fmt.Println(compression.RecommendedContentTypes()["+json"].Preference)
+	// Output:
+	// [br gzip zstd] 6 5 3 1024
+	// [zstd br gzip]
+}
+```
+
+### Recommended configuration
+
+| Setting | Recommended | Why |
+| --- | --- | --- |
+| Preference | brotli, gzip, zstd | brotli compresses text best (about 20% smaller than gzip on JSON), gzip is understood everywhere, zstd is the last resort for clients that only offer it |
+| Preference for JSON (`application/json`, `+json`) | zstd, brotli, gzip | zstd is as small as gzip level 9 at a fraction of the cost, which suits responses built per request |
+| gzip level | 6 (the library default) | the same ratio as level 9 at a sixth of the time; level 5 is 4% bigger |
+| brotli level | 5 | the knee of the curve: levels 6 to 8 do not compress better and cost up to twice as much, level 4 is 12% bigger, level 11 is 50 times slower |
+| zstd level | 3 (zstd's default) | levels 1 and 3 are within 3% of each other; level 9 is 7% smaller for 35% more time and four times the memory |
+| Minimum size | 1024 bytes | about one TCP segment: below it a response fits one packet whether compressed or not |
+| Content types | text, JSON, XML, JavaScript, ... (`text/*`, `+json`, `+xml`, ...) | what shrinks well. Never images (but SVG), video, audio, archives, PDF, fonts (compressed already), and never `text/event-stream` (a stream must reach the client as it is written; it is compressed only when named exactly) |
+
+The levels come from `BenchmarkLevels` (`task bench`), a 19 KB JSON list of records, median of 5 runs on a 3-core
+machine; ratio is compressed size over original, and the times are relative (they vary between machines):
+
+| Encoding / level | ratio | time |
+| --- | --- | --- |
+| gzip 1 | 0.159 | 55 us |
+| gzip 4 | 0.149 | 109 us |
+| gzip 5 | 0.133 | 133 us |
+| **gzip 6** | **0.128** | 93 us |
+| gzip 9 | 0.128 | 636 us |
+| brotli 1 | 0.147 | 184 us |
+| brotli 4 | 0.117 | 511 us |
+| **brotli 5** | **0.105** | 605 us |
+| brotli 6 | 0.105 | 716 us |
+| brotli 11 | 0.085 | 32.9 ms |
+| zstd 1 | 0.120 | 48 us |
+| **zstd 3** | **0.117** | 54 us |
+| zstd 9 | 0.109 | 75 us |
+
+`Recommended()`, `RecommendedContentTypes()` and `RecommendedAllowList()` return these values, each call a new copy to
+change. To start from the recommendation and adjust it, add `WithFallback` (the configuration of the content types
+without an entry of their own) or `WithContentType` after `WithDefaults()`; the options compose in any order, and the
+recommended JSON entry stays:
+
+<!-- example: compression ExampleRecommended -->
+```go
+func ExampleRecommended() {
+	// Start from the recommendation and change one thing: compress smaller bodies too.
+	cfg := compression.Recommended()
+	cfg.MinSize = 256
+	mw, err := compression.New(compression.WithDefaults(), compression.WithFallback(cfg))
+	if err != nil {
+		panic(err)
+	}
+
+	rec := httptest.NewRecorder()
+	serveRec(mw, http.MethodGet, "/", []string{"Accept-Encoding", "gzip, zstd"}, rec,
+		reply(http.StatusOK, []string{hdrCT, "application/json"}, strings.Repeat("a", 300)))
+	fmt.Println(rec.Header().Get("Content-Encoding")) // JSON keeps preferring zstd
+	// Output: zstd
+}
+```
+
+`WithFallback` was called `WithDefault` in v0.1.0; the old name still works and is deprecated.
+
+### Your own configuration
 
 <!-- example: compression ExampleNew -->
 ```go
 func ExampleNew() {
 	// compression.New() alone compresses text and JSON, zstd for JSON, then br, then gzip.
 	mw, err := compression.New(
-		compression.WithDefault(compression.Config{MinSize: 1}), // compress even tiny bodies here
+		compression.WithFallback(compression.Config{MinSize: 1}), // compress even tiny bodies here
 		compression.WithContentType("text/html", compression.Config{
 			Preference: []compression.Encoding{compression.Gzip, compression.Brotli},
 			Levels:     compression.Levels{Gzip: new(9)},
@@ -230,18 +310,17 @@ func ExampleNew() {
 }
 ```
 
-Defaults: zstd for JSON (`application/json`, `+json`) when the client accepts it, otherwise brotli, then gzip (zstd is the
-last resort for other types). The client's quality values come first (`q=0` excludes, `*` and `identity` are
+The client's quality values come first (`q=0` excludes, `*` and `identity` are
 understood; a header split over several lines is read as one list); the server preference breaks ties.
 
-Configuration is one default `Config` (`WithDefault`) plus optional per-content-type configs (`WithContentType`). A
+Configuration is one fallback `Config` (`WithFallback`) plus optional per-content-type configs (`WithContentType`). A
 `Config` has `Preference` (order), `Levels` (`compression.Levels{Gzip, Brotli, Zstd}`, each a pointer written with `new(n)`, so that level 0 is selectable: gzip -2 to 9, brotli 0 to 11, zstd 1 to 22; nil keeps the default), `MinSize`
-(default 1024) and `Disabled`; a content type's config inherits what it leaves at the zero value. The entry for a
+(recommended 1024) and `Disabled`; a content type's config inherits what it leaves at the zero value. The entry for a
 response is the most specific match: exact (`application/json`), then suffix (`+json`, the longest), then wildcard
 (`text/*`, the longest; `*/*` last), then the default. An entry also makes its type compressible. Encoder pools are keyed
 by encoding and level. Invalid configuration is an error from `New`.
 
-Other options: `WithContentTypes(patterns...)` (the allow-list; default text, JSON, XML, JavaScript and similar),
+Other options: `WithContentTypes(patterns...)` (the allow-list; recommended: text, JSON, XML, JavaScript and similar; no wildcard matches `text/event-stream`),
 `WithSkipPathPrefixes`, `WithSkipPathPatterns`, `WithOnlyPathPrefixes`, `WithSkipOperations`, `WithSkip(fn)`. Images
 other than SVG, video, audio, archives, PDF and fonts are never compressed.
 

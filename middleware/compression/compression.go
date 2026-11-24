@@ -2,12 +2,39 @@
 // gzip, negotiated from Accept-Encoding with its quality values. It only uses
 // the huma.Context interface.
 //
+// # Recommended configuration
+//
+// [New] with no option, or with [WithDefaults], uses the recommendation, which
+// can be read ([Recommended], [RecommendedContentTypes], [RecommendedAllowList])
+// and adjusted ([WithFallback], [WithContentType], [WithContentTypes]):
+//
+//   - Preference brotli, gzip, zstd: brotli compresses text best (about 20% smaller
+//     than gzip on JSON); gzip is understood by every client; zstd is the last
+//     resort for clients that only offer it.
+//   - Preference for JSON ("application/json", "+json") zstd, brotli, gzip: zstd
+//     is as small as gzip level 9 at a fraction of the cost, which suits
+//     responses built per request.
+//   - gzip level 6, the library default: the same ratio as level 9 at a sixth of
+//     the time, and 4% smaller than level 5 for 20% more time.
+//   - brotli level 5: levels 6 to 8 do not compress better and cost up to twice
+//     as much, level 4 is 12% bigger, and level 11 is 50 times slower.
+//   - zstd level 3, zstd's own default: levels 1 and 3 are within 3% of each
+//     other, level 9 is 7% smaller for 35% more time and four times the memory.
+//   - Minimum size 1024 bytes: about one TCP segment, so below it a response
+//     fits one packet whether compressed or not.
+//   - Allow-list: text, JSON, XML, JavaScript and the other text formats ("text/*",
+//     the "+json" and "+xml" suffixes, ...); never images (but SVG), video,
+//     audio, archives, PDF and fonts, which are compressed already, and never
+//     "text/event-stream", which is compressed only when named exactly.
+//
+// The figures are from BenchmarkLevels on a 19 KB JSON list (README).
+//
 // # Negotiation
 //
 // The coding with the highest q wins; ties go to the server preference. By
 // default JSON ("application/json", "+json") prefers zstd, then brotli, then
 // gzip, and everything else brotli, then gzip, then zstd. Both orders can be
-// replaced for all responses ([WithDefault]) and per content type
+// replaced for all responses ([WithFallback]) and per content type
 // ([WithContentType]). [Negotiate] is the pure function behind it.
 // A request without Accept-Encoding, or accepting nothing usable, gets the
 // response as is; the middleware never answers 406.
@@ -15,7 +42,7 @@
 // # Configuration
 //
 // A [Config] holds a preference order, compression levels by encoding, a minimum
-// size and a disabled flag. [WithDefault] sets the default one; [WithContentType]
+// size and a disabled flag. [WithFallback] sets the fallback one; [WithContentType]
 // sets one for a content type, which inherits what it leaves at the zero value.
 // The entry that matches a response is the most specific one: an exact type
 // ("application/json"), then a suffix ("+json", the longest), then a wildcard
@@ -26,7 +53,7 @@
 //
 // Only content types on the allow-list ([WithContentTypes]; text, JSON, XML,
 // JavaScript and similar by default) and never formats that are compressed
-// already. Bodies below [Config.MinSize] (1024 bytes by default) are sent as is:
+// already. Bodies below [Config.MinSize] (1024 bytes recommended) are sent as is:
 // a response with a known Content-Length is decided at once, otherwise up to
 // that many bytes are buffered. Responses are not compressed for HEAD, 204, 304,
 // 206 and 1xx statuses, when Content-Encoding is already set, or when
@@ -71,7 +98,6 @@
 package compression
 
 import (
-	"compress/gzip"
 	"io"
 	"net/http"
 	"path"
@@ -146,18 +172,9 @@ func New(opts ...Option) (Middleware, error) {
 	if err != nil {
 		return nil, err
 	}
-	builtin := &settings{
-		levels: Levels{
-			Gzip:   new(gzip.DefaultCompression),
-			Brotli: new(defaultBrotliLevel),
-			Zstd:   new(defaultZstdLevel),
-		},
-		pref:    []Encoding{Brotli, Gzip, Zstd},
-		minSize: defaultMinSize,
-	}
 	c := &compressor{
 		cfg:   cfg,
-		def:   overlay(builtin, cfg.def),
+		def:   overlay(recommendedSettings(), cfg.def),
 		exact: map[string]*settings{},
 		pools: map[poolKey]*encoderPool{},
 	}
@@ -214,7 +231,7 @@ func (c *compressor) settingsFor(mt string) *settings {
 		}
 	}
 	for _, e := range c.wildcards {
-		if strings.HasPrefix(mt, e.pattern) {
+		if mt != eventStream && strings.HasPrefix(mt, e.pattern) {
 			return e.s
 		}
 	}

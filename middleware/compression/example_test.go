@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
@@ -15,7 +16,7 @@ import (
 func ExampleNew() {
 	// compression.New() alone compresses text and JSON, zstd for JSON, then br, then gzip.
 	mw, err := compression.New(
-		compression.WithDefault(compression.Config{MinSize: 1}), // compress even tiny bodies here
+		compression.WithFallback(compression.Config{MinSize: 1}), // compress even tiny bodies here
 		compression.WithContentType("text/html", compression.Config{
 			Preference: []compression.Encoding{compression.Gzip, compression.Brotli},
 			Levels:     compression.Levels{Gzip: new(9)},
@@ -60,7 +61,40 @@ func ExampleWithContentType() {
 	}
 	rec := httptest.NewRecorder()
 	serveRec(mw, http.MethodGet, "/", []string{"Accept-Encoding", "gzip, br"}, rec,
-		reply(http.StatusOK, []string{"Content-Type", ctHTML}, big()))
+		reply(http.StatusOK, []string{hdrCT, ctHTML}, big()))
 	fmt.Println(rec.Header().Get("Content-Encoding"))
 	// Output: gzip
+}
+
+func ExampleWithDefaults() {
+	// compression.New() alone is the recommendation; WithDefaults() says so explicitly.
+	mw, err := compression.New(compression.WithDefaults())
+	if err != nil {
+		panic(err)
+	}
+	_ = mw
+
+	// The values are readable: Recommended, RecommendedContentTypes and RecommendedAllowList.
+	cfg := compression.Recommended()
+	fmt.Println(cfg.Preference, *cfg.Levels.Gzip, *cfg.Levels.Brotli, *cfg.Levels.Zstd, cfg.MinSize)
+	fmt.Println(compression.RecommendedContentTypes()["+json"].Preference)
+	// Output:
+	// [br gzip zstd] 6 5 3 1024
+	// [zstd br gzip]
+}
+
+func ExampleRecommended() {
+	// Start from the recommendation and change one thing: compress smaller bodies too.
+	cfg := compression.Recommended()
+	cfg.MinSize = 256
+	mw, err := compression.New(compression.WithDefaults(), compression.WithFallback(cfg))
+	if err != nil {
+		panic(err)
+	}
+
+	rec := httptest.NewRecorder()
+	serveRec(mw, http.MethodGet, "/", []string{"Accept-Encoding", "gzip, zstd"}, rec,
+		reply(http.StatusOK, []string{hdrCT, "application/json"}, strings.Repeat("a", 300)))
+	fmt.Println(rec.Header().Get("Content-Encoding")) // JSON keeps preferring zstd
+	// Output: zstd
 }

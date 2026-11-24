@@ -109,7 +109,7 @@ func TestContentTypes(t *testing.T) {
 		{name: "vendor json", ct: "application/vnd.api+json", wantComp: true},
 		{name: "html", ct: ctHTML, wantComp: true},
 		{name: "css", ct: ctCSS, wantComp: true},
-		{name: "javascript", ct: "application/javascript", wantComp: true},
+		{name: "javascript", ct: ctJS, wantComp: true},
 		{name: "xml", ct: "application/xml", wantComp: true},
 		{name: "svg", ct: "image/svg+xml", wantComp: true},
 		{name: "ndjson", ct: "application/x-ndjson", wantComp: true},
@@ -119,7 +119,7 @@ func TestContentTypes(t *testing.T) {
 		{name: "jpeg", ct: "image/jpeg"},
 		{name: "mp4", ct: "video/mp4"},
 		{name: "mp3", ct: "audio/mpeg"},
-		{name: "zip", ct: "application/zip"},
+		{name: "zip", ct: ctZip},
 		{name: "gzip type", ct: "application/gzip"},
 		{name: "pdf", ct: "application/pdf"},
 		{name: "woff2", ct: "font/woff2"},
@@ -207,7 +207,7 @@ func TestMinSize(t *testing.T) {
 			t.Parallel()
 			var opts []compression.Option
 			if tt.minSize >= 0 {
-				opts = append(opts, compression.WithDefault(compression.Config{MinSize: tt.minSize}))
+				opts = append(opts, compression.WithFallback(compression.Config{MinSize: tt.minSize}))
 			}
 			payload := string(bytes.Repeat([]byte("a"), tt.bodySize))
 			for _, withLength := range []bool{false, true} {
@@ -242,7 +242,7 @@ func preferenceCases() []preferenceCase {
 			ct:   ctJSON,
 			ae:   allAE,
 			opts: []compression.Option{
-				compression.WithDefault(compression.Config{Preference: []compression.Encoding{compression.Gzip}}),
+				compression.WithFallback(compression.Config{Preference: []compression.Encoding{compression.Gzip}}),
 			},
 			want: encGzip,
 		},
@@ -251,7 +251,7 @@ func preferenceCases() []preferenceCase {
 			ct:   ctText,
 			ae:   allAE,
 			opts: []compression.Option{
-				compression.WithDefault(
+				compression.WithFallback(
 					compression.Config{Preference: []compression.Encoding{compression.Zstd, compression.Gzip}},
 				),
 			},
@@ -262,7 +262,7 @@ func preferenceCases() []preferenceCase {
 			ct:   ctJSON,
 			ae:   allAE,
 			opts: []compression.Option{
-				compression.WithDefault(compression.Config{Preference: []compression.Encoding{compression.Brotli}}),
+				compression.WithFallback(compression.Config{Preference: []compression.Encoding{compression.Brotli}}),
 			},
 			want: encBrotli,
 		},
@@ -287,7 +287,7 @@ func typePreferenceCases() []preferenceCase {
 		{
 			name: "per type enables an encoding outside the global list", ct: ctHTML, ae: allAE,
 			opts: []compression.Option{
-				compression.WithDefault(compression.Config{Preference: []compression.Encoding{compression.Gzip}}),
+				compression.WithFallback(compression.Config{Preference: []compression.Encoding{compression.Gzip}}),
 				compression.WithContentType(
 					ctHTML,
 					compression.Config{Preference: []compression.Encoding{compression.Zstd}},
@@ -360,7 +360,7 @@ func typePreferenceCases() []preferenceCase {
 			ct:   ctText,
 			ae:   encZstd,
 			opts: []compression.Option{
-				compression.WithDefault(compression.Config{Preference: []compression.Encoding{compression.Gzip}}),
+				compression.WithFallback(compression.Config{Preference: []compression.Encoding{compression.Gzip}}),
 			},
 		},
 	}
@@ -401,7 +401,7 @@ func TestLevels(t *testing.T) {
 			mustNew(
 				t,
 				levelOpt(enc, level),
-				compression.WithDefault(compression.Config{Preference: []compression.Encoding{enc}}),
+				compression.WithFallback(compression.Config{Preference: []compression.Encoding{enc}}),
 			),
 			http.MethodGet,
 			[]string{hdrAE, string(enc)},
@@ -471,12 +471,12 @@ func invalidCases() []invalidCase {
 		},
 		{
 			name:    "unknown encoding preference",
-			opt:     compression.WithDefault(compression.Config{Preference: []compression.Encoding{encFake}}),
+			opt:     compression.WithFallback(compression.Config{Preference: []compression.Encoding{encFake}}),
 			wantErr: compression.ErrUnknownEncoding,
 		},
 		{
 			name:    "empty preference",
-			opt:     compression.WithDefault(compression.Config{Preference: []compression.Encoding{}}),
+			opt:     compression.WithFallback(compression.Config{Preference: []compression.Encoding{}}),
 			wantErr: compression.ErrEmptyPreference,
 		},
 		{
@@ -512,7 +512,7 @@ func invalidCases() []invalidCase {
 		{name: "bare plus", opt: compression.WithContentTypes("+"), wantErr: compression.ErrInvalidPattern},
 		{
 			name:    "negative min size",
-			opt:     compression.WithDefault(compression.Config{MinSize: -1}),
+			opt:     compression.WithFallback(compression.Config{MinSize: -1}),
 			wantErr: compression.ErrInvalidMinSize,
 		},
 		{
@@ -629,7 +629,7 @@ func TestStreamingWithoutFlusherSink(t *testing.T) {
 
 	w := &plainWriter{header: http.Header{}}
 	serveRec(
-		mustNew(t, compression.WithDefault(compression.Config{MinSize: 0})),
+		mustNew(t, compression.WithFallback(compression.Config{MinSize: 0})),
 		http.MethodGet,
 		"/x",
 		[]string{hdrAE, encGzip},
@@ -660,7 +660,7 @@ func (*plainWriter) WriteHeader(int)               {}
 func TestConcurrentPoolReuse(t *testing.T) {
 	t.Parallel()
 
-	mw := mustNew(t, compression.WithDefault(compression.Config{MinSize: 1}))
+	mw := mustNew(t, compression.WithFallback(compression.Config{MinSize: 1}))
 	encodings := []string{encGzip, encBrotli, encZstd}
 	var wg sync.WaitGroup
 	for g := range 12 {
@@ -754,7 +754,7 @@ func TestSinkErrors(t *testing.T) {
 			req.Header.Set(hdrAE, tt.ae)
 			ctx := newContextWithBody(req, httptest.NewRecorder(), &failingWriter{})
 			var writeErr error
-			mustNew(t, compression.WithDefault(compression.Config{MinSize: 1}))(ctx, func(c huma.Context) {
+			mustNew(t, compression.WithFallback(compression.Config{MinSize: 1}))(ctx, func(c huma.Context) {
 				c.SetHeader(hdrCT, ctText)
 				c.SetStatus(http.StatusOK)
 				for off := 0; off < len(tt.payload) && writeErr == nil; off += chunk {

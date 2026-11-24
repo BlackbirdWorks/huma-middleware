@@ -46,6 +46,9 @@ const (
 	ctCSS    = "text/css"
 	encFake  = "deflate"
 	opID     = "op-x"
+	ctJS     = "application/javascript"
+	ctZip    = "application/zip"
+	encIdent = "identity"
 )
 
 // big is a compressible body above the default minimum size.
@@ -186,5 +189,5 @@ func levelOpt(enc compression.Encoding, level int) compression.Option {
 		levels.Gzip = new(level)
 	}
 
-	return compression.WithDefault(compression.Config{Levels: levels})
+	return compression.WithFallback(compression.Config{Levels: levels})
 }

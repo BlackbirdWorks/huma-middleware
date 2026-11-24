@@ -23,7 +23,7 @@ func TestContentTypePrecedence(t *testing.T) {
 	t.Parallel()
 
 	opts := []compression.Option{
-		compression.WithDefault(prefer(compression.Brotli, compression.Gzip, compression.Zstd)),
+		compression.WithFallback(prefer(compression.Brotli, compression.Gzip, compression.Zstd)),
 		compression.WithContentType("*/*", prefer(compression.Zstd)),
 		compression.WithContentType("text/*", prefer(compression.Gzip)),
 		compression.WithContentType("application/*", prefer(compression.Brotli)),
@@ -75,13 +75,13 @@ func TestDefaultWhenNoEntryMatches(t *testing.T) {
 		{
 			name: "default preference applies to unmatched types", ct: ctText, want: encGzip,
 			opts: []compression.Option{
-				compression.WithDefault(prefer(compression.Gzip)),
+				compression.WithFallback(prefer(compression.Gzip)),
 				compression.WithContentType(ctHTML, prefer(compression.Brotli)),
 			},
 		},
 		{
 			name: "a default preference replaces the built-in json rule", ct: ctJSON, want: encBrotli,
-			opts: []compression.Option{compression.WithDefault(prefer(compression.Brotli, compression.Gzip))},
+			opts: []compression.Option{compression.WithFallback(prefer(compression.Brotli, compression.Gzip))},
 		},
 		{
 			name: "own json entry replaces the built-in one", ct: ctJSON, want: encGzip,
@@ -101,7 +101,7 @@ func TestDefaultWhenNoEntryMatches(t *testing.T) {
 		{
 			name: "an entry without preference inherits the default's", ct: ctHTML, want: encGzip,
 			opts: []compression.Option{
-				compression.WithDefault(prefer(compression.Gzip)),
+				compression.WithFallback(prefer(compression.Gzip)),
 				compression.WithContentType(ctHTML, compression.Config{MinSize: 10}),
 			},
 		},
@@ -166,13 +166,13 @@ func TestContentTypeMinSizeAndDisabled(t *testing.T) {
 		{
 			name: "default disabled with an enabled type", ct: ctHTML, body: big(), wantComp: true, wantVary: true,
 			opts: []compression.Option{
-				compression.WithDefault(compression.Config{Disabled: true}),
+				compression.WithFallback(compression.Config{Disabled: true}),
 				compression.WithContentType(ctHTML, compression.Config{}),
 			},
 		},
 		{
 			name: "default disabled", ct: ctText, body: big(),
-			opts: []compression.Option{compression.WithDefault(compression.Config{Disabled: true})},
+			opts: []compression.Option{compression.WithFallback(compression.Config{Disabled: true})},
 		},
 		{
 			name: "an entry makes a type compressible", ct: ctOctet, body: big(), wantComp: true, wantVary: true,
@@ -225,7 +225,7 @@ func TestPerTypeLevels(t *testing.T) {
 		return len(res.Raw)
 	}
 	mw := mustNew(t,
-		compression.WithDefault(compression.Config{Levels: compression.Levels{
+		compression.WithFallback(compression.Config{Levels: compression.Levels{
 			Gzip: new(1), Brotli: new(0), Zstd: new(1),
 		}}),
 		compression.WithContentType(ctHTML, compression.Config{Levels: compression.Levels{
@@ -255,7 +255,7 @@ func TestPoolsPerLevelInParallel(t *testing.T) {
 
 	mw := mustNew(
 		t,
-		compression.WithDefault(compression.Config{Levels: compression.Levels{Gzip: new(1)}}),
+		compression.WithFallback(compression.Config{Levels: compression.Levels{Gzip: new(1)}}),
 		compression.WithContentType(
 			ctHTML,
 			compression.Config{Levels: compression.Levels{Gzip: new(9)}},
@@ -364,7 +364,7 @@ func TestStreamBodyAdapters(t *testing.T) {
 		{name: "streaming adapter passes events through", ct: ctSSE, ae: encGzip, streamer: true},
 		{
 			name: "adapter without a stream callback", ct: ctText, ae: encGzip, wantEncoding: encGzip,
-			opts: []compression.Option{compression.WithDefault(compression.Config{MinSize: 1})},
+			opts: []compression.Option{compression.WithFallback(compression.Config{MinSize: 1})},
 		},
 		{name: "adapter without a stream callback, events", ct: ctSSE, ae: encGzip},
 	}

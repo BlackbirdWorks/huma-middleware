@@ -163,7 +163,7 @@ func TestServerSentEventsKeepTheirWriteDeadline(t *testing.T) {
 			name: "compressed on request", wantEncoding: encGzip,
 			opts: []compression.Option{
 				compression.WithContentTypes(ctSSE),
-				compression.WithDefault(compression.Config{MinSize: 1}),
+				compression.WithFallback(compression.Config{MinSize: 1}),
 			},
 		},
 	}
@@ -204,12 +204,12 @@ func TestDisabledDefaultDisablesJSONToo(t *testing.T) {
 	}{
 		{
 			name: "the built-in JSON rule does not enable it",
-			opts: []compression.Option{compression.WithDefault(compression.Config{Disabled: true})},
+			opts: []compression.Option{compression.WithFallback(compression.Config{Disabled: true})},
 		},
 		{
 			name: "an entry of the caller does, with the default preference", wantEnc: encBrotli,
 			opts: []compression.Option{
-				compression.WithDefault(compression.Config{Disabled: true}),
+				compression.WithFallback(compression.Config{Disabled: true}),
 				compression.WithContentType(ctJSON, compression.Config{}),
 			},
 		},

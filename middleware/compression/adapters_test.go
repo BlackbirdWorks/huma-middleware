@@ -91,7 +91,7 @@ func TestUnderRealAdapters(t *testing.T) {
 			t.Run(an+"/"+tt.name, func(t *testing.T) {
 				t.Parallel()
 				h, api := mk(t)
-				api.UseMiddleware(mustNew(t, compression.WithDefault(compression.Config{MinSize: 1})))
+				api.UseMiddleware(mustNew(t, compression.WithFallback(compression.Config{MinSize: 1})))
 				registerRoutes(api)
 
 				req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, tt.path, http.NoBody)

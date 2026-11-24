@@ -95,7 +95,7 @@ func headerCases1() []headerCase {
 			wantVary: []string{varyAE}, wantStatus: 200, wantBody: big(),
 		},
 		{
-			name: "identity only", reqHeaders: []string{hdrAE, "identity"}, next: reply(200, jsonHeaders(), big()),
+			name: "identity only", reqHeaders: []string{hdrAE, encIdent}, next: reply(200, jsonHeaders(), big()),
 			wantVary: []string{varyAE}, wantStatus: 200, wantBody: big(),
 		},
 		{

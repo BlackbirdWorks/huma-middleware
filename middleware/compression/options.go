@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"errors"
 	"fmt"
+	"maps"
 	"path"
 	"slices"
 	"strings"
@@ -36,16 +37,12 @@ const (
 	maxBrotliLevel = 11
 	minZstdLevel   = 1
 	maxZstdLevel   = 22
-
-	defaultBrotliLevel = 5
-	defaultZstdLevel   = 3
-	defaultMinSize     = 1024
 )
 
 // Levels are compression levels by encoding; a nil level keeps the default.
 // Ranges: gzip -2 to 9 (-1 is the library default, 0 no compression), brotli 0
-// to 11, zstd 1 to 22. The defaults are gzip -1, brotli 5 and zstd 3. Use
-// [Level] to write a level: Levels{Gzip: new(9)}.
+// to 11, zstd 1 to 22. The recommended ones are gzip 6, brotli 5 and zstd 3 ([Recommended]). Write a
+// level with new: Levels{Gzip: new(9)}.
 type Levels struct {
 	Gzip   *int
 	Brotli *int
@@ -76,7 +73,7 @@ func (l Levels) overlay(o Levels) Levels {
 }
 
 // Config is the compression configuration of a set of responses: the default
-// one ([WithDefault]) or that of a content type ([WithContentType]). The zero
+// one ([WithFallback]) or that of a content type ([WithContentType]). The zero
 // value of each field means "keep the default's" for a content type.
 type Config struct {
 	// Levels are the compression levels by encoding; see [Levels].
@@ -84,14 +81,14 @@ type Config struct {
 
 	// Preference is the server preference order. The client's q values decide
 	// first, the order breaks ties. Only the listed encodings are used. The
-	// default is brotli, gzip, zstd; for JSON ("application/json", "+json")
-	// zstd, brotli, gzip, unless the default config sets a preference.
+	// recommended order is brotli, gzip, zstd; for JSON ("application/json",
+	// "+json") zstd, brotli, gzip, see [Recommended] and [RecommendedContentTypes].
 	Preference []Encoding
 
 	// MinSize is the smallest body, in bytes, that is compressed. A response with
 	// a Content-Length below it, or that ends before reaching it, is sent as is.
 	// Empty bodies are never compressed. Zero keeps the default's (1024 for the
-	// default config).
+	// recommended config).
 	MinSize int
 
 	// Disabled turns compression off for the content type.
@@ -110,6 +107,7 @@ type config struct {
 	skipOps      []string
 	entries      []typeEntry
 	def          Config
+	recommended  bool
 }
 
 type typeEntry struct {
@@ -125,12 +123,12 @@ func newConfig(opts []Option) (*config, error) {
 			return nil, err
 		}
 	}
-	if len(c.def.Preference) == 0 {
-		// JSON: zstd first when the client accepts it, unless the caller has an entry for the same pattern.
-		json := Config{Preference: []Encoding{Zstd, Brotli, Gzip}}
-		for _, p := range []string{"application/json", "+json"} {
+	if c.recommended || len(c.def.Preference) == 0 {
+		// The recommended entries (JSON prefers zstd), unless the caller has an entry for the same pattern.
+		// Without WithDefaults they only apply while the fallback sets no preference of its own.
+		for _, p := range slices.Sorted(maps.Keys(RecommendedContentTypes())) {
 			if !slices.ContainsFunc(c.entries, func(e typeEntry) bool { return e.pattern == p }) {
-				c.entries = append(c.entries, typeEntry{p, json, true})
+				c.entries = append(c.entries, typeEntry{p, RecommendedContentTypes()[p], true})
 			}
 		}
 	}
@@ -176,10 +174,10 @@ func validConfig(cfg Config, isDefault bool) error {
 	return nil
 }
 
-// WithDefault sets the default configuration, used for every content type
-// without an entry of its own. Fields left at their zero value keep the
-// built-in defaults. Several calls are merged, later fields winning.
-func WithDefault(cfg Config) Option {
+// WithFallback sets the configuration used for every content type without an
+// entry of its own (the recommended one, see [Recommended], where a field is left
+// at its zero value). Several calls are merged, later fields winning.
+func WithFallback(cfg Config) Option {
 	return func(c *config) error {
 		if err := validConfig(cfg, true); err != nil {
 			return err
@@ -314,3 +312,9 @@ func WithSkip(fn func(huma.Context) bool) Option {
 		return nil
 	}
 }
+
+// WithDefault is the former name of [WithFallback].
+//
+// Deprecated: use [WithFallback], whose name says what it does and does not
+// get mistaken for [WithDefaults]. WithDefault is removed in the next minor release.
+func WithDefault(cfg Config) Option { return WithFallback(cfg) }
