@@ -75,10 +75,14 @@ type call struct {
 	hdr        http.Header
 	rhdr       http.Header
 	next       func(huma.Context)
-	url        url.URL
-	vals       [][1]string
-	status     int
-	panicked   bool
+	// each is addHeader as a value, created once so that copying headers does not allocate.
+	each func(name, value string)
+	url  url.URL
+	vals [][1]string
+	// used counts the entries of vals taken by addHeader.
+	used     int
+	status   int
+	panicked bool
 }
 
 // Header implements [http.ResponseWriter].
@@ -103,12 +107,18 @@ func New(opts ...Option) Middleware {
 	if cfg.disabled() {
 		return passthrough
 	}
-	keys := headerKeys(cfg.propagator)
+	var keys []string
+	if cfg.explicitPropagator {
+		keys = headerKeys(cfg.propagator)
+	}
 	pool := &sync.Pool{New: func() any {
-		return &call{hdr: make(http.Header, len(keys)), vals: make([][1]string, len(keys)), rhdr: http.Header{}}
+		c := &call{hdr: make(http.Header, len(keys)), vals: make([][1]string, len(keys)), rhdr: http.Header{}}
+		c.each = c.addHeader
+
+		return c
 	}}
 
-	inner := otelhttp.NewHandler(http.HandlerFunc(serveCall), operationName, cfg.otelOptions()...)
+	inner := otelhttp.NewHandler(http.HandlerFunc(serveCall), operationName, cfg.otelOptions(false)...)
 
 	return func(hctx huma.Context, next func(huma.Context)) {
 		route := routeOf(hctx)
@@ -206,7 +216,7 @@ func Handler(next http.Handler, opts ...Option) http.Handler {
 		return next
 	}
 
-	return otelhttp.NewHandler(recordingHandler(next, cfg.nameFormatter), operationName, cfg.otelOptions()...)
+	return otelhttp.NewHandler(recordingHandler(next, cfg.nameFormatter), operationName, cfg.otelOptions(true)...)
 }
 
 // setRoute sets http.route on the span from the pattern the router matched: the method and
@@ -280,6 +290,11 @@ func (c *call) fill(hctx huma.Context, next func(huma.Context), route string, ke
 		TLS:        hctx.TLS(),
 		Pattern:    route,
 	}
+	if keys == nil {
+		hctx.EachHeader(c.each)
+
+		return
+	}
 	for i, k := range keys {
 		if val := hctx.Header(k); val != "" {
 			c.vals[i][0] = val
@@ -288,7 +303,24 @@ func (c *call) fill(hctx huma.Context, next func(huma.Context), route string, ke
 	}
 }
 
+// addHeader copies one request header into the view, for propagators that are not known up front.
+func (c *call) addHeader(name, value string) {
+	key := http.CanonicalHeaderKey(name)
+	if _, dup := c.hdr[key]; dup {
+		c.hdr.Add(key, value)
+
+		return
+	}
+	if c.used == len(c.vals) {
+		c.vals = append(c.vals, [1]string{})
+	}
+	c.vals[c.used][0] = value
+	c.hdr[key] = c.vals[c.used][:]
+	c.used++
+}
+
 func (c *call) reset() {
+	c.used = 0
 	clear(c.hdr)
 	clear(c.rhdr)
 	clear(c.vals)

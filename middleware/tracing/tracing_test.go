@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
@@ -421,6 +422,68 @@ func TestHandlerPutsTheRouteOnTheSpan(t *testing.T) {
 			route, ok := attr(spans[0].Attributes, "http.route")
 			assert.Equal(t, tt.wantRoute != "", ok)
 			assert.Equal(t, tt.wantRoute, route.AsString())
+		})
+	}
+}
+
+// TestHumaFormFiltersByTemplate checks that the path and request filters of the huma form see the route
+// template only: the concrete URL path "/users/42" must not match a skip for "/users/42".
+func TestHumaFormFiltersByTemplate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		opts      []tracing.Option
+		wantSpans int
+	}{
+		{
+			name:      "a concrete path does not match a template route",
+			opts:      []tracing.Option{tracing.WithSkipPaths("/users/42")},
+			wantSpans: 1,
+		},
+		{name: "the template matches", opts: []tracing.Option{tracing.WithSkipPaths("/users/{id}")}},
+		{
+			name:      "the request filter belongs to the net/http form",
+			opts:      []tracing.Option{tracing.WithRequestFilter(func(*http.Request) bool { return false })},
+			wantSpans: 1,
+		},
+	}
+	for an, b := range builders() {
+		for _, tt := range tests {
+			t.Run(an+"/"+tt.name, func(t *testing.T) {
+				t.Parallel()
+				f := newFixture(t, b, tt.opts...)
+				require.Equal(t, http.StatusOK, f.do("/users/42").Code)
+				assert.Len(t, f.spans.GetSpans(), tt.wantSpans)
+			})
+		}
+	}
+}
+
+// TestGlobalPropagatorRegisteredAfterConstruction sets the global propagator, so it is not parallel.
+func TestGlobalPropagatorRegisteredAfterConstruction(t *testing.T) { //nolint:paralleltest // sets the global propagator
+	prev := otel.GetTextMapPropagator()
+	t.Cleanup(func() { otel.SetTextMapPropagator(prev) })
+
+	for an, b := range builders() { //nolint:paralleltest // see above
+		t.Run(an, func(t *testing.T) {
+			exp := tracetest.NewInMemoryExporter()
+			tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
+			h, api := b(t, nil)
+			// No explicit propagator: the middleware is built before the global one is registered.
+			api.UseMiddleware(tracing.New(tracing.WithTracerProvider(tp)))
+			huma.Get(api, "/users/{id}", func(context.Context, *idIn) (*out, error) { return &out{}, nil })
+			otel.SetTextMapPropagator(propagation.TraceContext{})
+
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/users/1", http.NoBody)
+			req.Header.Set("Traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+			req.Header.Add("X-Multi", "a")
+			req.Header.Add("X-Multi", "b")
+			h.ServeHTTP(httptest.NewRecorder(), req)
+
+			spans := exp.GetSpans()
+			require.Len(t, spans, 1)
+			assert.Equal(t, "4bf92f3577b34da6a3ce929d0e0e4736", spans[0].SpanContext.TraceID().String())
 		})
 	}
 }

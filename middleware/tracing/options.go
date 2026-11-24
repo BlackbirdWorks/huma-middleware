@@ -21,19 +21,20 @@ import (
 type Option func(*config)
 
 type config struct {
-	tracerProvider trace.TracerProvider
-	meterProvider  metric.MeterProvider
-	propagator     propagation.TextMapPropagator
-	nameFormatter  func(method, route string) string
-	filter         func(huma.Context) bool
-	requestFilter  func(*http.Request) bool
-	serverName     string
-	logger         *slog.Logger
-	enabled        *bool
-	skipOps        []string
-	skipPaths      []string
-	spanOptions    []trace.SpanStartOption
-	public         bool
+	meterProvider      metric.MeterProvider
+	propagator         propagation.TextMapPropagator
+	tracerProvider     trace.TracerProvider
+	enabled            *bool
+	nameFormatter      func(method, route string) string
+	filter             func(huma.Context) bool
+	requestFilter      func(*http.Request) bool
+	logger             *slog.Logger
+	serverName         string
+	skipOps            []string
+	skipPaths          []string
+	spanOptions        []trace.SpanStartOption
+	explicitPropagator bool
+	public             bool
 }
 
 func newConfig(opts []Option) *config {
@@ -61,11 +62,12 @@ func WithMeterProvider(mp metric.MeterProvider) Option {
 }
 
 // WithPropagators sets the propagator used to extract the incoming trace
-// context. The default is the global one at the time the middleware is built:
-// the header names it reads are fixed then, so set the OpenTelemetry globals
-// first or pass the propagator.
+// context. The default is the global one; then every request header is made
+// visible to it, so a global propagator registered after the middleware was
+// built works. With an explicit propagator only the headers it declares in
+// Fields are copied (cheaper).
 func WithPropagators(p propagation.TextMapPropagator) Option {
-	return func(c *config) { c.propagator = p }
+	return func(c *config) { c.propagator, c.explicitPropagator = p, true }
 }
 
 // WithSpanNameFormatter sets the span name. It receives the request method and
@@ -127,7 +129,7 @@ func (c *config) admit(ctx huma.Context, route string) bool {
 	return c.filter == nil || c.filter(ctx)
 }
 
-func (c *config) otelOptions() []otelhttp.Option {
+func (c *config) otelOptions(handlerForm bool) []otelhttp.Option {
 	opts := []otelhttp.Option{otelhttp.WithPropagators(c.propagator)}
 	if c.tracerProvider != nil {
 		opts = append(opts, otelhttp.WithTracerProvider(c.tracerProvider))
@@ -141,7 +143,9 @@ func (c *config) otelOptions() []otelhttp.Option {
 			return f(r.Method, routePart(r.Pattern))
 		}))
 	}
-	if c.requestFilter != nil || len(c.skipPaths) > 0 {
+	// In the huma form the filters ran before otelhttp, on the route template; the request
+	// filter here sees the concrete URL path and only belongs to the net/http form.
+	if handlerForm && (c.requestFilter != nil || len(c.skipPaths) > 0) {
 		f, paths := c.requestFilter, c.skipPaths
 		opts = append(opts, otelhttp.WithFilter(func(r *http.Request) bool {
 			if slices.Contains(paths, r.URL.Path) {
@@ -191,9 +195,7 @@ func WithLogger(l *slog.Logger) Option { return func(c *config) { c.logger = l }
 // middleware was built, so it is never taken for "disabled". Types that embed a
 // no-op provider are not detected either, and neither is one provider being a
 // no-op while the other is not (tracing continues normally then). Pass the
-// providers explicitly; the same goes for the propagator, whose header names
-// are read once, at construction, from [WithPropagators] or the global
-// propagator at that time.
+// providers explicitly.
 func WithEnabled(enabled bool) Option { return func(c *config) { c.enabled = &enabled } }
 
 // disabled decides once, at construction, whether the middleware is a
