@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // whyName is the reason of a test name that is no symbol.
@@ -52,7 +53,8 @@ func Check(root string, rules Rules) ([]Violation, error) {
 			return err
 		}
 		if d.IsDir() {
-			if n := d.Name(); path != root && (strings.HasPrefix(n, ".") || n == "coverage" || n == "bin") {
+			if n := d.Name(); path != root &&
+				(strings.HasPrefix(n, ".") || n == "coverage" || n == "bin" || n == "testdata") {
 				return filepath.SkipDir
 			}
 
@@ -105,11 +107,11 @@ type testFunc struct {
 }
 
 type pkg struct {
-	exported   map[string]bool // exported symbols, and Type_Method
-	unexported map[string]bool // the same for unexported ones, with the first letter in upper case
+	exported   map[string]bool
+	unexported map[string]bool
 	dir        string
 	tests      []testFunc
-	funcs      []string // exported functions and methods, "Name" or "Type_Method"
+	funcs      []string
 	hasSource  bool
 }
 
@@ -126,11 +128,12 @@ func (p *pkg) add(file *ast.File, rel string, isTest bool) {
 		if !ok || fn.Recv != nil || fn.Body == nil || !isTestFunc(fn) {
 			continue
 		}
+		param := paramName(fn)
 		p.tests = append(p.tests, testFunc{
 			file:     rel,
 			name:     fn.Name.Name,
-			table:    hasTableRun(fn.Body),
-			parallel: callsParallel(fn.Body),
+			table:    hasTableRun(fn.Body, param),
+			parallel: callsParallel(fn.Body, param),
 			internal: internal,
 		})
 	}
@@ -192,36 +195,65 @@ func (p *pkg) check(rules Rules, used map[string]bool) []Violation {
 		if !tf.table {
 			out = append(out, Violation{tf.file, tf.name, "not a table test: no range loop whose body calls t.Run"})
 		}
-		if key := tf.file + ":" + tf.name; !tf.parallel {
-			if _, ok := rules.Serial[key]; ok {
-				used["serial "+key] = true
-			} else {
-				out = append(out, Violation{tf.file, tf.name, "does not call t.Parallel() and is not listed as serial"})
-			}
+		if !tf.parallel {
+			out = append(
+				out,
+				listed(
+					rules.Serial,
+					"serial",
+					tf.file+":"+tf.name,
+					tf,
+					"does not call t.Parallel() and is not listed as serial",
+					used,
+				)...)
 		}
-		if p.validName(tf) {
-			continue
-		}
-		key := p.dir + ":" + tf.name
-		if _, ok := rules.Names[key]; ok {
-			used["name "+key] = true
-		} else {
-			out = append(out, Violation{tf.file, tf.name, whyName})
+		if !p.validName(tf) {
+			out = append(out, listed(rules.Names, "name", p.dir+":"+tf.name, tf, whyName, used)...)
 		}
 	}
+	seen := map[string]bool{}
 	for _, f := range p.funcs {
+		if seen[f] {
+			out = append(
+				out,
+				Violation{p.dir, f, "ambiguous: a function and a method (or two methods) map to the same test name"},
+			)
+
+			continue
+		}
+		seen[f] = true
 		if tested[f] {
 			continue
 		}
 		key := p.dir + ":" + f
-		if _, ok := rules.Untested[key]; ok {
-			used["untested "+key] = true
-		} else {
-			out = append(out, Violation{p.dir, f, "exported function or method without a Test function of that name"})
-		}
+		out = append(
+			out,
+			listed(
+				rules.Untested,
+				"untested",
+				key,
+				testFunc{file: p.dir, name: f},
+				"exported function or method without a Test function of that name",
+				used,
+			)...)
 	}
 
 	return out
+}
+
+// listed is the violation why for tf, unless the allow-list has a reason for key; an entry without a reason is a
+// violation too.
+func listed(list map[string]string, kind, key string, tf testFunc, why string, used map[string]bool) []Violation {
+	reason, ok := list[key]
+	if !ok {
+		return []Violation{{tf.file, tf.name, why}}
+	}
+	used[kind+" "+key] = true
+	if strings.TrimSpace(reason) == "" {
+		return []Violation{{"allow-list", key, "the " + kind + " entry has no reason"}}
+	}
+
+	return nil
 }
 
 func (p *pkg) validName(tf testFunc) bool {
@@ -269,22 +301,57 @@ func upper(s string) string {
 	return string(r)
 }
 
-// isTestFunc reports whether fn is a test function taking a pointer to a [testing.T].
+// isTestFunc reports whether fn is a test function the go tool runs: Test followed by anything but a lower case
+// letter, with one parameter, a pointer to a [testing.T] (qualified, or dot-imported).
 func isTestFunc(fn *ast.FuncDecl) bool {
-	if !strings.HasPrefix(fn.Name.Name, "Test") || fn.Type.Params == nil || len(fn.Type.Params.List) != 1 {
+	rest, found := strings.CutPrefix(fn.Name.Name, "Test")
+	if !found || fn.Type.Params == nil || len(fn.Type.Params.List) != 1 {
+		return false
+	}
+	if r, _ := utf8.DecodeRuneInString(rest); unicode.IsLower(r) {
 		return false
 	}
 	star, ok := fn.Type.Params.List[0].Type.(*ast.StarExpr)
 	if !ok {
 		return false
 	}
-	sel, ok := star.X.(*ast.SelectorExpr)
+	switch t := star.X.(type) {
+	case *ast.SelectorExpr:
+		return t.Sel.Name == "T"
+	case *ast.Ident:
+		return t.Name == "T"
+	}
 
-	return ok && sel.Sel.Name == "T"
+	return false
 }
 
-// hasTableRun reports whether the body has a range statement whose body calls a Run method.
-func hasTableRun(body *ast.BlockStmt) bool {
+// paramName is the name of the [testing.T] parameter, empty when it is blank or missing.
+func paramName(fn *ast.FuncDecl) string {
+	names := fn.Type.Params.List[0].Names
+	if len(names) == 0 || names[0].Name == "_" {
+		return ""
+	}
+
+	return names[0].Name
+}
+
+// calls reports whether n is a call of the method name on the identifier recv.
+func calls(n ast.Node, recv, name string) bool {
+	call, ok := n.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != name {
+		return false
+	}
+	id, ok := sel.X.(*ast.Ident)
+
+	return ok && id.Name == recv
+}
+
+// hasTableRun reports whether the body has a range statement whose body calls Run on the test parameter.
+func hasTableRun(body *ast.BlockStmt, param string) bool {
 	found := false
 	ast.Inspect(body, func(n ast.Node) bool {
 		rs, ok := n.(*ast.RangeStmt)
@@ -292,10 +359,8 @@ func hasTableRun(body *ast.BlockStmt) bool {
 			return !found
 		}
 		ast.Inspect(rs.Body, func(m ast.Node) bool {
-			if call, isCall := m.(*ast.CallExpr); isCall {
-				if sel, isSel := call.Fun.(*ast.SelectorExpr); isSel && sel.Sel.Name == "Run" {
-					found = true
-				}
+			if calls(m, param, "Run") {
+				found = true
 			}
 
 			return !found
@@ -307,17 +372,11 @@ func hasTableRun(body *ast.BlockStmt) bool {
 	return found
 }
 
-// callsParallel reports whether the function itself (not a subtest closure) calls Parallel.
-func callsParallel(body *ast.BlockStmt) bool {
+// callsParallel reports whether the function itself (not a subtest closure) calls Parallel on the test parameter.
+func callsParallel(body *ast.BlockStmt, param string) bool {
 	for _, st := range body.List {
-		es, ok := st.(*ast.ExprStmt)
-		if !ok {
-			continue
-		}
-		if call, isCall := es.X.(*ast.CallExpr); isCall {
-			if sel, isSel := call.Fun.(*ast.SelectorExpr); isSel && sel.Sel.Name == "Parallel" {
-				return true
-			}
+		if es, ok := st.(*ast.ExprStmt); ok && calls(es.X, param, "Parallel") {
+			return true
 		}
 	}
 

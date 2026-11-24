@@ -11,7 +11,17 @@ import (
 	"github.com/blackbirdworks/huma-middleware/internal/testrules"
 )
 
-const badGo = "package"
+const (
+	srcClient = "package p\n\ntype Client struct{}\n\nfunc (Client) Close() {}\n" +
+		"\nfunc Client_Close() {}\n\nfunc New() {}\n"
+	srcDotImport = "package p_test\n\nimport . \"testing\"\n\nfunc TestNew(tb *T) {\n\ttb.Parallel()\n" +
+		"\tfor range 1 {\n\t\ttb.Run(\"x\", nil)\n\t}\n}\n"
+	srcOtherT = testHead + "func TestNew(t *testing.T) {\n\tvar f *testing.T\n\tf.Parallel()\n" +
+		"\tfor range 1 {\n\t\tf.Run(\"x\", nil)\n\t}\n}\n"
+	badGo       = "package"
+	whyParallel = "p_test.go: TestNew: does not call t.Parallel() and is not listed as serial"
+	whyTable    = "p_test.go: TestNew: not a table test: no range loop whose body calls t.Run"
+)
 
 const (
 	srcName    = "p.go"
@@ -71,8 +81,8 @@ func styleCases() []checkCase {
 			name:  "violations come sorted",
 			files: map[string]string{srcName: srcNew, testName: testHead + "func TestNew(t *testing.T) {}\n"},
 			want: []string{
-				"p_test.go: TestNew: does not call t.Parallel() and is not listed as serial",
-				"p_test.go: TestNew: not a table test: no range loop whose body calls t.Run",
+				whyParallel,
+				whyTable,
 			},
 		},
 		{name: "this repository", repo: true, rules: repoRules()},
@@ -113,7 +123,7 @@ func styleCases() []checkCase {
 				srcName:  srcNew,
 				testName: testHead + "func TestNew(t *testing.T) { t.Parallel() }\n",
 			},
-			want: []string{"p_test.go: TestNew: not a table test: no range loop whose body calls t.Run"},
+			want: []string{whyTable},
 		},
 	}
 }
@@ -129,7 +139,7 @@ func symbolCases() []checkCase {
 		{
 			name:  "serial and not listed",
 			files: map[string]string{srcName: srcNew, testName: serialTest},
-			want:  []string{"p_test.go: TestNew: does not call t.Parallel() and is not listed as serial"},
+			want:  []string{whyParallel},
 		},
 		{
 			name:  "a name that is no symbol",
@@ -179,11 +189,74 @@ func symbolCases() []checkCase {
 	}
 }
 
+// shapeCases are the cases of what the checker reads: which directories, which functions, which parameters.
+func shapeCases() []checkCase {
+	return []checkCase{
+		{
+			name:  "testdata is skipped",
+			files: map[string]string{srcName: srcNew, testName: passTest, "testdata/broken.go": badGo},
+		},
+		{
+			name: "a function and a method with one test name",
+			files: map[string]string{
+				srcName:  srcClient,
+				testName: passTest + "\n" + namedFunc("TestClient_Close"),
+			},
+			want: []string{
+				".: Client_Close: ambiguous: a function and a method (or two methods) map to the same test name",
+			},
+		},
+		{
+			name:  "an entry without a reason",
+			files: map[string]string{srcName: srcNew + "\nfunc Extra() {}\n", testName: passTest},
+			rules: testrules.Rules{Untested: map[string]string{".:Extra": " "}},
+			want:  []string{"allow-list: .:Extra: the untested entry has no reason"},
+		},
+		{
+			name:  "a lower case letter after Test is no test",
+			files: map[string]string{srcName: srcNew, testName: passTest + "\nfunc Testfixture(t *testing.T) {}\n"},
+		},
+		{
+			name: "a dot-imported T and another parameter name",
+			files: map[string]string{
+				srcName:  srcNew,
+				testName: srcDotImport,
+			},
+		},
+		{
+			name: "Run and Parallel on something else than the test parameter",
+			files: map[string]string{
+				srcName:  srcNew,
+				testName: srcOtherT,
+			},
+			want: []string{
+				whyParallel,
+				whyTable,
+			},
+		},
+		{
+			name:  "a blank parameter cannot run anything",
+			files: map[string]string{srcName: srcNew, testName: testHead + "func TestNew(_ *testing.T) {}\n"},
+			want: []string{
+				whyParallel,
+				whyTable,
+			},
+		},
+		{
+			name: "a parameter of another type",
+			files: map[string]string{
+				srcName:  srcNew,
+				testName: passTest + "\nfunc TestOther(t *int) {}\n\nfunc TestSlice(t *[]int) {}\n",
+			},
+		},
+	}
+}
+
 // TestCheck covers the checker on small packages, and on this repository.
 func TestCheck(t *testing.T) {
 	t.Parallel()
 
-	tests := append(styleCases(), symbolCases()...)
+	tests := append(append(styleCases(), symbolCases()...), shapeCases()...)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
