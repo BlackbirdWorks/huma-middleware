@@ -27,7 +27,9 @@
 //
 // [Rewrite] (the default, also used for an unknown mode) serves the request with the cleaned path. The
 // caller's [http.Request] is not modified: the middleware passes a shallow
-// copy with its own [url.URL]. URL.Path and URL.RawPath are kept consistent
+// copy with its own [url.URL]. Once the handler returned, the parsed multipart form (whose temporary
+// files net/http removes through the original request) and the routing pattern of the copy are
+// set on the original, so the server and the wrappers around see them. URL.Path and URL.RawPath are kept consistent
 // (RawPath is set only when the default encoding of Path differs from the
 // cleaned escaped path) and Request.RequestURI is rewritten to the cleaned
 // escaped path plus the original query, so a handler or access log that reads
@@ -141,10 +143,26 @@ func Handler(opts ...Option) func(http.Handler) http.Handler {
 			case Reject:
 				cfg.reject.ServeHTTP(w, r)
 			default: // Rewrite
-				next.ServeHTTP(w, rewrite(r, cleaned))
+				serveRewritten(next, w, r, cleaned)
 			}
 		})
 	}
+}
+
+// serveRewritten serves the request with the cleaned path. net/http removes the temporary files of an
+// upload through the original request, and wrappers around this one read the routing pattern from it:
+// the multipart form and the pattern of the copy are given back to it.
+func serveRewritten(next http.Handler, w http.ResponseWriter, r *http.Request, cleaned string) {
+	r2 := rewrite(r, cleaned)
+	defer func() {
+		if r2.MultipartForm != nil {
+			r.MultipartForm = r2.MultipartForm
+		}
+		if r2.Pattern != "" {
+			r.Pattern = r2.Pattern
+		}
+	}()
+	next.ServeHTTP(w, r2)
 }
 
 func redirect(w http.ResponseWriter, r *http.Request, cleaned string) {

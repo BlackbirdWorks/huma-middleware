@@ -1,7 +1,9 @@
 package cleanpath_test
 
 import (
+	"bytes"
 	"context"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -485,4 +487,36 @@ func FuzzClean(f *testing.F) {
 			assert.NotContains(t, e+"/", "/../")
 		}
 	})
+}
+
+// TestRewriteGivesBackWhatItsCopyLearned checks the multipart form (whose temporary files net/http removes
+// through the original request) and the routing pattern (read by the wrappers around).
+func TestRewriteGivesBackWhatItsCopyLearned(t *testing.T) {
+	t.Parallel()
+
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	fw, err := mw.CreateFormFile("file", "a.txt")
+	require.NoError(t, err)
+	_, err = fw.Write([]byte("hello"))
+	require.NoError(t, err)
+	require.NoError(t, mw.Close())
+
+	var seen *http.Request
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /upload/{id}", func(w http.ResponseWriter, r *http.Request) {
+		seen = r
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		assert.NoError(t, r.ParseMultipartForm(1)) //nolint:gosec // G120: the test body is a few bytes
+	})
+	h := cleanpath.Handler()(mux)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "//upload//7", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	require.NotNil(t, seen)
+	require.NotNil(t, req.MultipartForm, "the original request holds the form, so the server removes its files")
+	assert.Same(t, seen.MultipartForm, req.MultipartForm)
+	assert.Equal(t, "POST /upload/{id}", req.Pattern)
+	assert.Equal(t, "//upload//7", req.RequestURI, "the original request is otherwise untouched")
 }
