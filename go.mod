@@ -3,8 +3,10 @@ module github.com/blackbirdworks/huma-middleware
 go 1.27.4
 
 require (
+	github.com/andybalholm/brotli v1.3.0
 	github.com/danielgtaylor/huma/v2 v2.41.0
 	github.com/go-chi/chi/v5 v5.5.0
+	github.com/klauspost/compress v1.20.5
 	github.com/stretchr/testify v1.12.1
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
 	go.opentelemetry.io/otel v1.47.0
