@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
@@ -12,8 +13,7 @@ import (
 	"github.com/blackbirdworks/huma-middleware/middleware/compression"
 )
 
-func ExampleNew() {
-	// compression.New() alone compresses text and JSON, zstd for JSON, then br, then gzip.
+func ExampleWithSkipPathPrefixes() {
 	mw, err := compression.New(
 		compression.WithDefault(compression.Config{MinSize: 1}), // compress even tiny bodies here
 		compression.WithContentType("text/html", compression.Config{
@@ -28,7 +28,9 @@ func ExampleNew() {
 	mux := http.NewServeMux()
 	api := humago.New(mux, huma.DefaultConfig("example", "1.0.0"))
 	api.UseMiddleware(mw)
-	huma.Get(api, "/items", func(context.Context, *struct{}) (*listOut, error) { return &listOut{}, nil })
+	huma.Get(api, "/items", func(context.Context, *struct{}) (*struct{ Body []string }, error) {
+		return &struct{ Body []string }{Body: []string{"a"}}, nil
+	})
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/items", http.NoBody)
 	req.Header.Set("Accept-Encoding", "gzip, br, zstd")
@@ -59,8 +61,52 @@ func ExampleWithContentType() {
 		return
 	}
 	rec := httptest.NewRecorder()
-	serveRec(mw, http.MethodGet, "/", []string{"Accept-Encoding", "gzip, br"}, rec,
-		reply(http.StatusOK, []string{"Content-Type", ctHTML}, big()))
+	serveRec(mw, http.MethodGet, "/", []string{"Accept-Encoding", aeGzipBr}, rec,
+		reply(http.StatusOK, []string{hdrCT, ctHTML}, big()))
 	fmt.Println(rec.Header().Get("Content-Encoding"))
 	// Output: gzip
+}
+
+func ExampleNew() {
+	// No option is the recommended setup: text and JSON are compressed, zstd first for JSON, then br, then gzip.
+	mw, err := compression.New()
+	if err != nil {
+		panic(err)
+	}
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("example", "1.0.0"))
+	api.UseMiddleware(mw)
+	huma.Get(api, "/items", func(context.Context, *struct{}) (*struct{ Body []string }, error) {
+		return &struct{ Body []string }{Body: strings.Split(strings.Repeat("item ", 400), " ")}, nil
+	})
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/items", http.NoBody)
+	req.Header.Set("Accept-Encoding", "gzip, br, zstd")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	fmt.Println(rec.Header().Get("Content-Encoding"), rec.Header().Get("Vary"))
+	// Output: zstd Accept-Encoding
+}
+
+func ExampleDefaultConfig() {
+	// Start from the defaults and change one thing: compress smaller bodies too.
+	cfg := compression.DefaultConfig()
+	cfg.MinSize = 16
+	mw, err := compression.New(compression.WithDefault(cfg))
+	if err != nil {
+		panic(err)
+	}
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("example", "1.0.0"))
+	api.UseMiddleware(mw)
+	huma.Get(api, "/items", func(context.Context, *struct{}) (*struct{ Body []string }, error) {
+		return &struct{ Body []string }{Body: strings.Split(strings.Repeat("item ", 10), " ")}, nil
+	})
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/items", http.NoBody)
+	req.Header.Set("Accept-Encoding", "gzip, zstd")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	fmt.Println(rec.Header().Get("Content-Encoding")) // JSON keeps preferring zstd
+	// Output: zstd
 }

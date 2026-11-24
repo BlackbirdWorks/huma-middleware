@@ -42,6 +42,7 @@ import (
 	"net"
 	"net/http"
 	"runtime"
+	"sync"
 	"sync/atomic"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -158,6 +159,12 @@ func (c *config) stack() string {
 // writes the response, and then a plain text 500 is written otherwise.
 func New(api huma.API, opts ...Option) Middleware {
 	cfg := newConfig(opts)
+	pool := &sync.Pool{New: func() any {
+		g := &guard{}
+		g.body.g = g
+
+		return g
+	}}
 
 	return func(ctx huma.Context, next func(huma.Context)) {
 		if cfg.skip != nil && cfg.skip(ctx) {
@@ -165,9 +172,10 @@ func New(api huma.API, opts ...Option) Middleware {
 
 			return
 		}
-		g := &guard{ctxBase: ctx}
+		g, _ := pool.Get().(*guard)
+		g.ctxBase, g.retained = ctx, false
 		g.body.W = ctx.BodyWriter()
-		g.body.g = g
+		g.wrote.Store(false)
 		defer func() {
 			v := recover()
 			if v == nil {
@@ -197,6 +205,10 @@ func New(api huma.API, opts ...Option) Middleware {
 			}
 		}()
 		next(g)
+		if !g.retained {
+			// Reached without a panic only: after one, whatever still holds the guard keeps it.
+			pool.Put(g)
+		}
 	}
 }
 
@@ -212,6 +224,8 @@ type guard struct {
 
 	body  tracker
 	wrote atomic.Bool
+	// retained is set when a stream callback may outlive the handler: the guard is then not reused.
+	retained bool
 }
 
 // tracker is the body writer of a guard.
@@ -258,6 +272,7 @@ type bodyStreamer interface {
 
 // StreamBody keeps streaming through a callback working on the adapters that need it.
 func (g *guard) StreamBody(fn func(io.Writer)) {
+	g.retained = true
 	bs, ok := g.ctxBase.(bodyStreamer)
 	if !ok {
 		fn(&g.body)

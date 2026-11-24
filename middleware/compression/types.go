@@ -2,6 +2,9 @@ package compression
 
 import "strings"
 
+// eventStream is the media type of server-sent events.
+const eventStream = "text/event-stream"
+
 // mediaType returns the lower-case media type of a Content-Type value, without
 // parameters.
 func mediaType(ct string) string {
@@ -13,8 +16,13 @@ func mediaType(ct string) string {
 // matchType reports whether the media type mt matches pattern: "*/*" (any),
 // "type/*" (a whole type), "+suffix" (a structured syntax suffix such as
 // "+json") or an exact "type/subtype". Patterns are lower case.
+//
+// A stream of server-sent events is only matched by its exact name: no wildcard
+// covers "text/event-stream", as events must reach the client as they are written.
 func matchType(pattern, mt string) bool {
 	switch {
+	case mt == eventStream:
+		return pattern == mt
 	case pattern == "*/*":
 		return true
 	case strings.HasPrefix(pattern, "+"):
@@ -24,31 +32,6 @@ func matchType(pattern, mt string) bool {
 	default:
 		return mt == pattern
 	}
-}
-
-// defaultTypes are compressed unless the allow-list is replaced with
-// [WithContentTypes].
-func defaultTypes() []string {
-	return []string{
-		"text/*", "+json", "+xml", "application/json", "application/javascript", "application/x-javascript",
-		"application/ecmascript", "application/xml", "application/x-ndjson", "application/yaml",
-		"application/x-yaml", "application/graphql", "application/wasm",
-	}
-}
-
-// isDefaultAllowed matches the default list, minus Server-Sent Events, which
-// must reach the client as they are written.
-func isDefaultAllowed(mt string) bool {
-	if mt == "text/event-stream" {
-		return false
-	}
-	for _, p := range defaultTypes() {
-		if matchType(p, mt) {
-			return true
-		}
-	}
-
-	return false
 }
 
 // alreadyCompressed reports whether the media type is a format that is

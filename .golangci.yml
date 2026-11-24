@@ -315,6 +315,17 @@ linters:
               desc: dependency isolation.
             - pkg: github.com/klauspost/compress
               desc: dependency isolation.
+        "accesslog has no OTel and no compression":
+          files:
+            - "**/middleware/accesslog/**"
+            - "!$test"
+          deny:
+            - pkg: go.opentelemetry.io
+              desc: accesslog reads trace IDs through the request logger, it has no OTel import.
+            - pkg: github.com/andybalholm/brotli
+              desc: dependency isolation.
+            - pkg: github.com/klauspost/compress
+              desc: dependency isolation.
         "tracing has no compression libraries":
           files:
             - "**/middleware/tracing/**"

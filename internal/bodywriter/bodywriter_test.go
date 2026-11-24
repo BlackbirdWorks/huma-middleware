@@ -47,7 +47,47 @@ func (r *responseOnly) Header() http.Header       { return r.header }
 func (*responseOnly) Write(p []byte) (int, error) { return len(p), nil }
 func (*responseOnly) WriteHeader(int)             {}
 
-func TestFlush(t *testing.T) {
+func TestPassthrough_Flush(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		w           func() io.Writer
+		name        string
+		wantFlushed bool
+	}{
+		{
+			name:        "a response writer that flushes",
+			w:           func() io.Writer { return httptest.NewRecorder() },
+			wantFlushed: true,
+		},
+		{
+			name: "a response writer that cannot flush",
+			w:    func() io.Writer { return &responseOnly{header: http.Header{}} },
+		},
+		{
+			name:        "a flusher that is not a response writer",
+			w:           func() io.Writer { return &flusherOnly{} },
+			wantFlushed: true,
+		},
+		{name: "a writer that cannot flush", w: func() io.Writer { return &bytes.Buffer{} }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			w := tt.w()
+			p := &bodywriter.Passthrough{W: w}
+			p.Flush()
+			switch v := w.(type) {
+			case *httptest.ResponseRecorder:
+				assert.Equal(t, tt.wantFlushed, v.Flushed)
+			case *flusherOnly:
+				assert.Equal(t, 1, v.flushed)
+			}
+		})
+	}
+}
+
+func TestPassthrough_FlushError(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -76,21 +116,13 @@ func TestFlush(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			w := tt.w()
-			p := &bodywriter.Passthrough{W: w}
+			p := &bodywriter.Passthrough{W: tt.w()}
 			require.ErrorIs(t, p.FlushError(), tt.wantErr)
-			p.Flush()
-			switch v := w.(type) {
-			case *httptest.ResponseRecorder:
-				assert.Equal(t, tt.wantFlushed, v.Flushed)
-			case *flusherOnly:
-				assert.Equal(t, 2, v.flushed)
-			}
 		})
 	}
 }
 
-func TestUnwrap(t *testing.T) {
+func TestPassthrough_Unwrap(t *testing.T) {
 	t.Parallel()
 
 	rec := httptest.NewRecorder()
@@ -110,7 +142,7 @@ func TestUnwrap(t *testing.T) {
 	}
 }
 
-func TestSetWriteDeadline(t *testing.T) {
+func TestPassthrough_SetWriteDeadline(t *testing.T) {
 	t.Parallel()
 
 	deadline := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)

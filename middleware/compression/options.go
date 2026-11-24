@@ -36,16 +36,12 @@ const (
 	maxBrotliLevel = 11
 	minZstdLevel   = 1
 	maxZstdLevel   = 22
-
-	defaultBrotliLevel = 5
-	defaultZstdLevel   = 3
-	defaultMinSize     = 1024
 )
 
 // Levels are compression levels by encoding; a nil level keeps the default.
 // Ranges: gzip -2 to 9 (-1 is the library default, 0 no compression), brotli 0
-// to 11, zstd 1 to 22. The defaults are gzip -1, brotli 5 and zstd 3. Use
-// [Level] to write a level: Levels{Gzip: new(9)}.
+// to 11, zstd 1 to 22. The defaults are gzip 6, brotli 5 and zstd 3 ([DefaultConfig]). Write a
+// level with new: Levels{Gzip: new(9)}.
 type Levels struct {
 	Gzip   *int
 	Brotli *int
@@ -84,14 +80,14 @@ type Config struct {
 
 	// Preference is the server preference order. The client's q values decide
 	// first, the order breaks ties. Only the listed encodings are used. The
-	// default is brotli, gzip, zstd; for JSON ("application/json", "+json")
-	// zstd, brotli, gzip, unless the default config sets a preference.
+	// default order is brotli, gzip, zstd; for JSON ("application/json",
+	// "+json") zstd, brotli, gzip, see [DefaultConfig].
 	Preference []Encoding
 
 	// MinSize is the smallest body, in bytes, that is compressed. A response with
 	// a Content-Length below it, or that ends before reaching it, is sent as is.
 	// Empty bodies are never compressed. Zero keeps the default's (1024 for the
-	// default config).
+	// built-in config).
 	MinSize int
 
 	// Disabled turns compression off for the content type.
@@ -125,12 +121,16 @@ func newConfig(opts []Option) (*config, error) {
 			return nil, err
 		}
 	}
-	if len(c.def.Preference) == 0 {
-		// JSON: zstd first when the client accepts it, unless the caller has an entry for the same pattern.
-		json := Config{Preference: []Encoding{Zstd, Brotli, Gzip}}
+	// The built-in rule for JSON: zstd first, when the fallback allows zstd, unless the caller has an entry for
+	// the same pattern. With a fallback that lacks zstd it would be the fallback's own order, so no entry is needed.
+	fallback := DefaultConfig().Preference
+	if len(c.def.Preference) > 0 {
+		fallback = c.def.Preference
+	}
+	if json := jsonPreference(fallback); !slices.Equal(json, fallback) {
 		for _, p := range []string{"application/json", "+json"} {
 			if !slices.ContainsFunc(c.entries, func(e typeEntry) bool { return e.pattern == p }) {
-				c.entries = append(c.entries, typeEntry{p, json, true})
+				c.entries = append(c.entries, typeEntry{p, Config{Preference: slices.Clone(json)}, true})
 			}
 		}
 	}
@@ -176,9 +176,14 @@ func validConfig(cfg Config, isDefault bool) error {
 	return nil
 }
 
-// WithDefault sets the default configuration, used for every content type
-// without an entry of its own. Fields left at their zero value keep the
-// built-in defaults. Several calls are merged, later fields winning.
+// WithDefault sets the fallback configuration, used for every content type
+// without an entry of its own. Fields left at their zero value keep the built-in
+// defaults ([DefaultConfig]); start from [DefaultConfig] to change one thing.
+// Several calls are merged, later fields winning.
+//
+// The built-in rule for JSON (zstd first, then the fallback's order) follows the
+// fallback preference, as long as it includes zstd; a [WithContentType] entry
+// for "application/json" or "+json" replaces it.
 func WithDefault(cfg Config) Option {
 	return func(c *config) error {
 		if err := validConfig(cfg, true); err != nil {

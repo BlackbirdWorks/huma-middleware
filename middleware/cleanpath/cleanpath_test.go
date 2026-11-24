@@ -16,20 +16,23 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/blackbirdworks/huma-middleware/internal/racedetect"
 	"github.com/blackbirdworks/huma-middleware/middleware/cleanpath"
 )
 
 const (
-	pathAB      = "/a/b"
-	pathEncLead = "/%2Fa"
-	pathDouble  = "/a//b"
-	pathABC     = "/a/b/c"
-	pathDotDot  = "/a/../b"
-	pathATrail  = "/a/"
-	pathABTrail = "/a/b/"
-	pathAdmin   = "/admin"
-	pathEncMid  = "/a%2Fb/c"
-	pathEncDots = "/a%2F..%2Fb"
+	pathEvil      = "/evil.example"
+	pathDotInside = "/a/./b"
+	pathAB        = "/a/b"
+	pathEncLead   = "/%2Fa"
+	pathDouble    = "/a//b"
+	pathABC       = "/a/b/c"
+	pathDotDot    = "/a/../b"
+	pathATrail    = "/a/"
+	pathABTrail   = "/a/b/"
+	pathAdmin     = "/admin"
+	pathEncMid    = "/a%2Fb/c"
+	pathEncDots   = "/a%2F..%2Fb"
 )
 
 // seen is what the wrapped handler observed.
@@ -56,8 +59,88 @@ func run(
 	return rec, got, req
 }
 
-func TestRewriteKeepSlash(t *testing.T) {
+func FuzzClean(f *testing.F) {
+	for _, s := range []string{
+		"/", "//", "/a//b", "/a/../b", "/..", "/a/%2e%2e/b", "/a%2F..%2Fb", "/a/.", "/a/b/",
+		"/%2e", "/.%2E/x", "/a b", "/caf%C3%A9",
+	} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, raw string) {
+		u, err := url.ParseRequestURI(raw)
+		if err != nil || u.Path == "*" || u.Opaque != "" {
+			t.Skip()
+		}
+		for _, ts := range []cleanpath.TrailingSlash{cleanpath.KeepSlash, cleanpath.StripSlash, cleanpath.AddSlash} {
+			clean := func(in *url.URL) (*url.URL, string) {
+				var out *url.URL
+				var requestURI string
+				h := cleanpath.Handler(
+					cleanpath.WithTrailingSlash(ts),
+				)(
+					http.HandlerFunc(
+						func(_ http.ResponseWriter, r *http.Request) { out, requestURI = r.URL, r.RequestURI },
+					),
+				)
+				req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", http.NoBody)
+				c := *in
+				req.URL = &c
+				req.RequestURI = in.RequestURI()
+				h.ServeHTTP(httptest.NewRecorder(), req)
+
+				return out, requestURI
+			}
+			once, onceURI := clean(u)
+			twice, _ := clean(once)
+			e := once.EscapedPath()
+			assert.Equal(t, e, twice.EscapedPath(), "idempotent")
+			assert.Equal(t, once.Path, twice.Path)
+			pathPart, _, _ := strings.Cut(onceURI, "?")
+			assert.Equal(t, once.EscapedPath(), pathPart, "RequestURI is consistent with the cleaned path")
+			assert.True(t, strings.HasPrefix(e, "/"))
+			assert.NotContains(t, e, "//")
+			lower := strings.ToLower(e)
+			for seg := range strings.SplitSeq(lower, "/") {
+				assert.NotContains(t, []string{".", "..", "%2e", ".%2e", "%2e.", "%2e%2e"}, seg)
+			}
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", http.NoBody)
+			c := *u
+			req.URL = &c
+			cleanpath.Handler(cleanpath.WithMode(cleanpath.Redirect), cleanpath.WithTrailingSlash(ts))(
+				http.NotFoundHandler()).ServeHTTP(rec, req)
+			if loc := rec.Header().Get("Location"); loc != "" {
+				assertSameOrigin(t, loc)
+			}
+			assert.NotContains(t, e+"/", "/./")
+			assert.NotContains(t, e+"/", "/../")
+		}
+	})
+}
+
+// TestHandler covers cleaning, the real routers behind it and what the rewritten copy gives back.
+func TestHandler(t *testing.T) {
 	t.Parallel()
+
+	tests := []struct {
+		run  func(t *testing.T)
+		name string
+	}{
+		{name: "rewrite", run: runRewriteKeepSlash},
+		{name: "empty and relative", run: runEmptyAndRelativePaths},
+		{name: "real routers", run: runInFrontOfRealRouters},
+		{name: "multipart and pattern given back", run: runRewriteGivesBackWhatItsCopyLearned},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tt.run(t)
+		})
+	}
+}
+
+func runRewriteKeepSlash(t *testing.T) {
+	t.Helper()
 
 	tests := []struct {
 		name        string
@@ -67,6 +150,24 @@ func TestRewriteKeepSlash(t *testing.T) {
 		wantRaw     string
 	}{
 		{name: "clean", target: pathAB, wantEscaped: pathAB, wantPath: pathAB},
+		{
+			name:        "scheme-relative host",
+			target:      "//evil.example",
+			wantEscaped: pathEvil,
+			wantPath:    pathEvil,
+		},
+		{
+			name:        "three slashes host",
+			target:      "///evil.example/x",
+			wantEscaped: "/evil.example/x",
+			wantPath:    "/evil.example/x",
+		},
+		{
+			name:        "dotdot then double slash",
+			target:      "/a/..//evil.example",
+			wantEscaped: pathEvil,
+			wantPath:    pathEvil,
+		},
 		{name: "root", target: "/", wantEscaped: "/", wantPath: "/"},
 		{
 			name:        "leading double slash",
@@ -78,7 +179,7 @@ func TestRewriteKeepSlash(t *testing.T) {
 		{name: "double slash", target: pathDouble, wantEscaped: pathAB, wantPath: pathAB},
 		{name: "many slashes", target: "/a////b///c", wantEscaped: pathABC, wantPath: pathABC},
 		{name: "dot", target: "/./a", wantEscaped: "/a", wantPath: "/a"},
-		{name: "dot middle", target: "/a/./b", wantEscaped: pathAB, wantPath: pathAB},
+		{name: "dot middle", target: pathDotInside, wantEscaped: pathAB, wantPath: pathAB},
 		{name: "dotdot", target: pathDotDot, wantEscaped: "/b", wantPath: "/b"},
 		{name: "dotdot above root", target: "/..", wantEscaped: "/", wantPath: "/"},
 		{name: "dotdot many above root", target: "/../../a", wantEscaped: "/a", wantPath: "/a"},
@@ -138,8 +239,8 @@ func TestRewriteKeepSlash(t *testing.T) {
 	}
 }
 
-func TestEmptyAndRelativePaths(t *testing.T) {
-	t.Parallel()
+func runEmptyAndRelativePaths(t *testing.T) {
+	t.Helper()
 
 	tests := []struct {
 		name string
@@ -165,236 +266,8 @@ func TestEmptyAndRelativePaths(t *testing.T) {
 	}
 }
 
-func TestTrailingSlashPolicy(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name   string
-		target string
-		want   string
-		policy cleanpath.TrailingSlash
-	}{
-		{name: "keep with", policy: cleanpath.KeepSlash, target: pathATrail, want: pathATrail},
-		{name: "keep without", policy: cleanpath.KeepSlash, target: "/a", want: "/a"},
-		{name: "strip with", policy: cleanpath.StripSlash, target: pathATrail, want: "/a"},
-		{name: "strip without", policy: cleanpath.StripSlash, target: "/a", want: "/a"},
-		{name: "strip nested", policy: cleanpath.StripSlash, target: "/a//b/", want: pathAB},
-		{name: "strip root", policy: cleanpath.StripSlash, target: "/", want: "/"},
-		{name: "strip root doubled", policy: cleanpath.StripSlash, target: "//", want: "/"},
-		{name: "add without", policy: cleanpath.AddSlash, target: "/a", want: pathATrail},
-		{name: "add with", policy: cleanpath.AddSlash, target: pathATrail, want: pathATrail},
-		{name: "add root", policy: cleanpath.AddSlash, target: "/", want: "/"},
-		{name: "add after dotdot", policy: cleanpath.AddSlash, target: "/a/b/..", want: pathATrail},
-		{name: "add to root dotdot", policy: cleanpath.AddSlash, target: "/a/..", want: "/"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			_, got, _ := run(t, tt.target, http.MethodGet, cleanpath.WithTrailingSlash(tt.policy))
-			assert.Equal(t, tt.want, got.escaped)
-		})
-	}
-}
-
-func TestRedirect(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name         string
-		method       string
-		target       string
-		wantLocation string
-		wantCode     int
-		wantCalled   bool
-	}{
-		{
-			name:         "get",
-			method:       http.MethodGet,
-			target:       pathDouble,
-			wantCode:     http.StatusMovedPermanently,
-			wantLocation: pathAB,
-		},
-		{
-			name:         "head",
-			method:       http.MethodHead,
-			target:       pathDotDot,
-			wantCode:     http.StatusMovedPermanently,
-			wantLocation: "/b",
-		},
-		{
-			name:         "post",
-			method:       http.MethodPost,
-			target:       pathDouble,
-			wantCode:     http.StatusPermanentRedirect,
-			wantLocation: pathAB,
-		},
-		{
-			name:         "delete",
-			method:       http.MethodDelete,
-			target:       "/a/./b",
-			wantCode:     http.StatusPermanentRedirect,
-			wantLocation: pathAB,
-		},
-		{
-			name:         "query kept",
-			method:       http.MethodGet,
-			target:       "/a//b?x=1&y=%2F",
-			wantCode:     http.StatusMovedPermanently,
-			wantLocation: "/a/b?x=1&y=%2F",
-		},
-		{
-			name:         "empty query kept",
-			method:       http.MethodGet,
-			target:       "/a//b?",
-			wantCode:     http.StatusMovedPermanently,
-			wantLocation: "/a/b?",
-		},
-		{
-			name:         "encoded slash kept",
-			method:       http.MethodGet,
-			target:       "/a%2Fb//c",
-			wantCode:     http.StatusMovedPermanently,
-			wantLocation: pathEncMid,
-		},
-		{
-			name:         "no open redirect",
-			method:       http.MethodGet,
-			target:       "//evil.com//x",
-			wantCode:     http.StatusMovedPermanently,
-			wantLocation: "/evil.com/x",
-		},
-		{
-			name:         "backslash stays encoded",
-			method:       http.MethodGet,
-			target:       "/%5Cevil.com//x",
-			wantCode:     http.StatusMovedPermanently,
-			wantLocation: "/%5Cevil.com/x",
-		},
-		{name: "clean passes", method: http.MethodGet, target: pathAB, wantCode: http.StatusOK, wantCalled: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			rec, got, _ := run(t, tt.target, tt.method, cleanpath.WithMode(cleanpath.Redirect))
-			assert.Equal(t, tt.wantCode, rec.Code)
-			assert.Equal(t, tt.wantLocation, rec.Header().Get("Location"))
-			assert.Equal(t, tt.wantCalled, got.called)
-		})
-	}
-}
-
-func TestReject(t *testing.T) {
-	t.Parallel()
-
-	custom := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadRequest) })
-	tests := []struct {
-		name       string
-		target     string
-		opts       []cleanpath.Option
-		wantCode   int
-		wantCalled bool
-	}{
-		{
-			name:     "default 404",
-			opts:     []cleanpath.Option{cleanpath.WithMode(cleanpath.Reject)},
-			target:   pathDouble,
-			wantCode: http.StatusNotFound,
-		},
-		{
-			name:     "custom handler",
-			opts:     []cleanpath.Option{cleanpath.WithMode(cleanpath.Reject), cleanpath.WithRejectHandler(custom)},
-			target:   pathDotDot,
-			wantCode: http.StatusBadRequest,
-		},
-		{
-			name: "clean passes", opts: []cleanpath.Option{cleanpath.WithMode(cleanpath.Reject)},
-			target: pathAB, wantCode: http.StatusOK, wantCalled: true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			rec, got, _ := run(t, tt.target, http.MethodGet, tt.opts...)
-			assert.Equal(t, tt.wantCode, rec.Code)
-			assert.Equal(t, tt.wantCalled, got.called)
-		})
-	}
-}
-
-func TestSkips(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name   string
-		method string
-		target string
-		opaque string
-		want   string
-		opts   []cleanpath.Option
-	}{
-		{name: "connect", method: http.MethodConnect, target: pathDouble, want: pathDouble},
-		{name: "options star", method: http.MethodOptions, target: "*", want: "*"},
-		{name: "opaque url", method: http.MethodGet, target: "", opaque: "0", want: ""},
-		{
-			name:   "predicate",
-			method: http.MethodGet,
-			target: "/skip//me",
-			opts: []cleanpath.Option{
-				cleanpath.WithSkip(func(r *http.Request) bool { return strings.HasPrefix(r.URL.Path, "/skip") }),
-			},
-			want: "/skip//me",
-		},
-		{
-			name: "predicate false", method: http.MethodGet, target: "/other//me",
-			opts: []cleanpath.Option{cleanpath.WithSkip(func(*http.Request) bool { return false })},
-			want: "/other/me",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			var got string
-			h := cleanpath.Handler(
-				tt.opts...)(
-				http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { got = r.URL.Path }),
-			)
-			req := httptest.NewRequestWithContext(context.Background(), tt.method, "/", http.NoBody)
-			req.URL = &url.URL{Path: tt.target, Opaque: tt.opaque}
-			h.ServeHTTP(httptest.NewRecorder(), req)
-			assert.Equal(t, tt.want, got)
-		})
-	}
-}
-
-// TestNoAllocationsOnCleanPaths is sequential on purpose: [testing.AllocsPerRun] panics in parallel tests and
-// would count the allocations of other goroutines.
-func TestNoAllocationsOnCleanPaths(t *testing.T) { //nolint:paralleltest // AllocsPerRun needs a serial test
-	tests := []struct {
-		name       string
-		target     string
-		opts       []cleanpath.Option
-		wantAllocs float64
-	}{
-		{name: "plain", target: pathABC},
-		{name: "root", target: "/"},
-		{name: "trailing", target: pathABTrail},
-		// url.URL.EscapedPath allocates to validate a RawPath; that is outside this package.
-		{name: "encoded", target: "/caf%C3%A9/a%2Fb", wantAllocs: 1},
-		{name: "strip", target: pathAB, opts: []cleanpath.Option{cleanpath.WithTrailingSlash(cleanpath.StripSlash)}},
-		{name: "add", target: pathABTrail, opts: []cleanpath.Option{cleanpath.WithTrailingSlash(cleanpath.AddSlash)}},
-	}
-	for _, tt := range tests { //nolint:paralleltest // see the test comment
-		t.Run(tt.name, func(t *testing.T) {
-			h := cleanpath.Handler(tt.opts...)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, tt.target, http.NoBody)
-			rec := httptest.NewRecorder()
-			assert.InDelta(t, tt.wantAllocs, testing.AllocsPerRun(100, func() { h.ServeHTTP(rec, req) }), 0)
-		})
-	}
-}
-
-func TestInFrontOfRealRouters(t *testing.T) {
-	t.Parallel()
+func runInFrontOfRealRouters(t *testing.T) {
+	t.Helper()
 
 	type out struct {
 		Body struct {
@@ -439,60 +312,10 @@ func TestInFrontOfRealRouters(t *testing.T) {
 	}
 }
 
-func FuzzClean(f *testing.F) {
-	for _, s := range []string{
-		"/", "//", "/a//b", "/a/../b", "/..", "/a/%2e%2e/b", "/a%2F..%2Fb", "/a/.", "/a/b/",
-		"/%2e", "/.%2E/x", "/a b", "/caf%C3%A9",
-	} {
-		f.Add(s)
-	}
-	f.Fuzz(func(t *testing.T, raw string) {
-		u, err := url.ParseRequestURI(raw)
-		if err != nil || u.Path == "*" || u.Opaque != "" {
-			t.Skip()
-		}
-		for _, ts := range []cleanpath.TrailingSlash{cleanpath.KeepSlash, cleanpath.StripSlash, cleanpath.AddSlash} {
-			clean := func(in *url.URL) (*url.URL, string) {
-				var out *url.URL
-				var requestURI string
-				h := cleanpath.Handler(
-					cleanpath.WithTrailingSlash(ts),
-				)(
-					http.HandlerFunc(
-						func(_ http.ResponseWriter, r *http.Request) { out, requestURI = r.URL, r.RequestURI },
-					),
-				)
-				req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", http.NoBody)
-				c := *in
-				req.URL = &c
-				req.RequestURI = in.RequestURI()
-				h.ServeHTTP(httptest.NewRecorder(), req)
-
-				return out, requestURI
-			}
-			once, onceURI := clean(u)
-			twice, _ := clean(once)
-			e := once.EscapedPath()
-			assert.Equal(t, e, twice.EscapedPath(), "idempotent")
-			assert.Equal(t, once.Path, twice.Path)
-			pathPart, _, _ := strings.Cut(onceURI, "?")
-			assert.Equal(t, once.EscapedPath(), pathPart, "RequestURI is consistent with the cleaned path")
-			assert.True(t, strings.HasPrefix(e, "/"))
-			assert.NotContains(t, e, "//")
-			lower := strings.ToLower(e)
-			for seg := range strings.SplitSeq(lower, "/") {
-				assert.NotContains(t, []string{".", "..", "%2e", ".%2e", "%2e.", "%2e%2e"}, seg)
-			}
-			assert.NotContains(t, e+"/", "/./")
-			assert.NotContains(t, e+"/", "/../")
-		}
-	})
-}
-
-// TestRewriteGivesBackWhatItsCopyLearned checks the multipart form (whose temporary files net/http removes
+// runRewriteGivesBackWhatItsCopyLearned checks the multipart form (whose temporary files net/http removes
 // through the original request) and the routing pattern (read by the wrappers around).
-func TestRewriteGivesBackWhatItsCopyLearned(t *testing.T) {
-	t.Parallel()
+func runRewriteGivesBackWhatItsCopyLearned(t *testing.T) {
+	t.Helper()
 
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
@@ -513,10 +336,473 @@ func TestRewriteGivesBackWhatItsCopyLearned(t *testing.T) {
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "//upload//7", &body)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	h.ServeHTTP(httptest.NewRecorder(), req)
+	t.Cleanup(func() { // the handler is called directly, so the server that removes the upload files is not there
+		if req.MultipartForm != nil {
+			assert.NoError(t, req.MultipartForm.RemoveAll())
+		}
+	})
 
 	require.NotNil(t, seen)
 	require.NotNil(t, req.MultipartForm, "the original request holds the form, so the server removes its files")
 	assert.Same(t, seen.MultipartForm, req.MultipartForm)
 	assert.Equal(t, "POST /upload/{id}", req.Pattern)
 	assert.Equal(t, "//upload//7", req.RequestURI, "the original request is otherwise untouched")
+}
+
+// TestWithMode covers the redirect and reject modes.
+func TestWithMode(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		run  func(t *testing.T)
+		name string
+	}{
+		{name: "redirect", run: runRedirect},
+		{name: "reject", run: runReject},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tt.run(t)
+		})
+	}
+}
+
+// redirectCase is a request to the Redirect mode and what it must answer.
+type redirectCase struct {
+	name         string
+	method       string
+	target       string
+	wantLocation string
+	wantCode     int
+	wantCalled   bool
+}
+
+// redirectCases are the cases of the Redirect mode.
+func redirectCases() []redirectCase {
+	return []redirectCase{
+		{
+			name:         "get",
+			method:       http.MethodGet,
+			target:       pathDouble,
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: pathAB,
+		},
+		{
+			name:         "head",
+			method:       http.MethodHead,
+			target:       pathDotDot,
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: "/b",
+		},
+		{
+			name:         "post",
+			method:       http.MethodPost,
+			target:       pathDouble,
+			wantCode:     http.StatusPermanentRedirect,
+			wantLocation: pathAB,
+		},
+		{
+			name:         "delete",
+			method:       http.MethodDelete,
+			target:       pathDotInside,
+			wantCode:     http.StatusPermanentRedirect,
+			wantLocation: pathAB,
+		},
+		{
+			name:         "query kept",
+			method:       http.MethodGet,
+			target:       "/a//b?x=1&y=%2F",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: "/a/b?x=1&y=%2F",
+		},
+		{
+			name:         "empty query kept",
+			method:       http.MethodGet,
+			target:       "/a//b?",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: "/a/b?",
+		},
+		{
+			name:         "encoded slash kept",
+			method:       http.MethodGet,
+			target:       "/a%2Fb//c",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: pathEncMid,
+		},
+		{
+			name:         "no open redirect",
+			method:       http.MethodGet,
+			target:       "//evil.com//x",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: "/evil.com/x",
+		},
+		{
+			name:         "backslash stays encoded",
+			method:       http.MethodGet,
+			target:       "/%5Cevil.com//x",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: "/%5Cevil.com/x",
+		},
+		{name: "clean passes", method: http.MethodGet, target: pathAB, wantCode: http.StatusOK, wantCalled: true},
+	}
+}
+
+// openRedirectCases are attempts at an open redirect: whatever the path, the Location is a same-origin path.
+func openRedirectCases() []redirectCase {
+	return []redirectCase{
+		{
+			name:         "scheme-relative host",
+			method:       http.MethodGet,
+			target:       "//evil.example",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: pathEvil,
+		},
+		{
+			name:       "backslash host",
+			method:     http.MethodGet,
+			target:     "/\\evil.example",
+			wantCode:   http.StatusOK,
+			wantCalled: true,
+		},
+		{
+			name:         "encoded backslash host",
+			method:       http.MethodGet,
+			target:       "/%5Cevil.example//x",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: "/%5Cevil.example/x",
+		},
+		{
+			name:         "encoded slashes host",
+			method:       http.MethodGet,
+			target:       "/%2F%2Fevil.example//x",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: "/%2F%2Fevil.example/x",
+		},
+		{
+			name:         "three slashes host",
+			method:       http.MethodGet,
+			target:       "///evil.example",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: pathEvil,
+		},
+		{
+			name:         "dot then backslash",
+			method:       http.MethodGet,
+			target:       "/./\\evil.example",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: "/%5Cevil.example",
+		},
+		{
+			name:         "dotdot then double slash",
+			method:       http.MethodGet,
+			target:       "/a/..//evil.example",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: pathEvil,
+		},
+		{
+			name:         "tab between slashes",
+			method:       http.MethodGet,
+			target:       "/%09/evil.example//x",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: "/%09/evil.example/x",
+		},
+		{
+			name:         "host with query",
+			method:       http.MethodGet,
+			target:       "//evil.example?next=//other",
+			wantCode:     http.StatusMovedPermanently,
+			wantLocation: "/evil.example?next=//other",
+		},
+		{
+			name:       "backslash host with query",
+			method:     http.MethodGet,
+			target:     "/\\evil.example?x=1",
+			wantCode:   http.StatusOK,
+			wantCalled: true,
+		},
+	}
+}
+
+func runRedirect(t *testing.T) {
+	t.Helper()
+
+	tests := append(redirectCases(), openRedirectCases()...)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			rec, got, _ := run(t, tt.target, tt.method, cleanpath.WithMode(cleanpath.Redirect))
+			assert.Equal(t, tt.wantCode, rec.Code)
+			loc := rec.Header().Get("Location")
+			assert.Equal(t, tt.wantLocation, loc)
+			assert.Equal(t, tt.wantCalled, got.called)
+			if loc != "" {
+				assertSameOrigin(t, loc)
+			}
+		})
+	}
+}
+
+func runReject(t *testing.T) {
+	t.Helper()
+
+	custom := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadRequest) })
+	tests := []struct {
+		name       string
+		target     string
+		opts       []cleanpath.Option
+		wantCode   int
+		wantCalled bool
+	}{
+		{
+			name:     "default 404",
+			opts:     []cleanpath.Option{cleanpath.WithMode(cleanpath.Reject)},
+			target:   pathDouble,
+			wantCode: http.StatusNotFound,
+		},
+		{
+			name:     "custom handler",
+			opts:     []cleanpath.Option{cleanpath.WithMode(cleanpath.Reject), cleanpath.WithRejectHandler(custom)},
+			target:   pathDotDot,
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name: "clean passes", opts: []cleanpath.Option{cleanpath.WithMode(cleanpath.Reject)},
+			target: pathAB, wantCode: http.StatusOK, wantCalled: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			rec, got, _ := run(t, tt.target, http.MethodGet, tt.opts...)
+			assert.Equal(t, tt.wantCode, rec.Code)
+			assert.Equal(t, tt.wantCalled, got.called)
+		})
+	}
+}
+
+// TestWithTrailingSlash covers the trailing slash policies.
+func TestWithTrailingSlash(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		run  func(t *testing.T)
+		name string
+	}{
+		{name: "policies", run: runTrailingSlashPolicy},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tt.run(t)
+		})
+	}
+}
+
+func runTrailingSlashPolicy(t *testing.T) {
+	t.Helper()
+
+	tests := []struct {
+		name   string
+		target string
+		want   string
+		policy cleanpath.TrailingSlash
+	}{
+		{name: "keep with", policy: cleanpath.KeepSlash, target: pathATrail, want: pathATrail},
+		{name: "keep without", policy: cleanpath.KeepSlash, target: "/a", want: "/a"},
+		{name: "strip with", policy: cleanpath.StripSlash, target: pathATrail, want: "/a"},
+		{name: "strip without", policy: cleanpath.StripSlash, target: "/a", want: "/a"},
+		{name: "strip nested", policy: cleanpath.StripSlash, target: "/a//b/", want: pathAB},
+		{name: "strip root", policy: cleanpath.StripSlash, target: "/", want: "/"},
+		{name: "strip root doubled", policy: cleanpath.StripSlash, target: "//", want: "/"},
+		{name: "add without", policy: cleanpath.AddSlash, target: "/a", want: pathATrail},
+		{name: "add with", policy: cleanpath.AddSlash, target: pathATrail, want: pathATrail},
+		{name: "add root", policy: cleanpath.AddSlash, target: "/", want: "/"},
+		{name: "add after dotdot", policy: cleanpath.AddSlash, target: "/a/b/..", want: pathATrail},
+		{name: "add to root dotdot", policy: cleanpath.AddSlash, target: "/a/..", want: "/"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, got, _ := run(t, tt.target, http.MethodGet, cleanpath.WithTrailingSlash(tt.policy))
+			assert.Equal(t, tt.want, got.escaped)
+		})
+	}
+}
+
+// TestWithSkip covers the requests that are left alone.
+func TestWithSkip(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		run  func(t *testing.T)
+		name string
+	}{
+		{name: "skips", run: runSkips},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tt.run(t)
+		})
+	}
+}
+
+func runSkips(t *testing.T) {
+	t.Helper()
+
+	tests := []struct {
+		name   string
+		method string
+		target string
+		opaque string
+		want   string
+		opts   []cleanpath.Option
+	}{
+		{name: "connect", method: http.MethodConnect, target: pathDouble, want: pathDouble},
+		{name: "options star", method: http.MethodOptions, target: "*", want: "*"},
+		{name: "opaque url", method: http.MethodGet, target: "", opaque: "0", want: ""},
+		{
+			name:   "predicate",
+			method: http.MethodGet,
+			target: "/skip//me",
+			opts: []cleanpath.Option{
+				cleanpath.WithSkip(func(r *http.Request) bool { return strings.HasPrefix(r.URL.Path, "/skip") }),
+			},
+			want: "/skip//me",
+		},
+		{
+			name: "predicate false", method: http.MethodGet, target: "/other//me",
+			opts: []cleanpath.Option{cleanpath.WithSkip(func(*http.Request) bool { return false })},
+			want: "/other/me",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var got string
+			h := cleanpath.Handler(
+				tt.opts...)(
+				http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { got = r.URL.Path }),
+			)
+			req := httptest.NewRequestWithContext(context.Background(), tt.method, "/", http.NoBody)
+			req.URL = &url.URL{Path: tt.target, Opaque: tt.opaque}
+			h.ServeHTTP(httptest.NewRecorder(), req)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestAllocs pins what the middleware allocates.
+func TestAllocs(t *testing.T) { //nolint:paralleltest // AllocsPerRun panics in parallel tests
+	tests := []struct {
+		run  func(t *testing.T)
+		name string
+	}{
+		{name: "clean paths", run: runNoAllocationsOnCleanPaths},
+		{name: "rewrite", run: runRewriteAllocations},
+	}
+	for _, tt := range tests { //nolint:paralleltest // AllocsPerRun panics in parallel tests
+		t.Run(tt.name, tt.run)
+	}
+}
+
+// runNoAllocationsOnCleanPaths is sequential on purpose: [testing.AllocsPerRun] panics in parallel tests and
+// would count the allocations of other goroutines.
+func runNoAllocationsOnCleanPaths(t *testing.T) {
+	t.Helper()
+	if racedetect.Enabled {
+		t.Skip("allocation counts mean nothing under the race detector; see task allocs")
+	}
+	tests := []struct {
+		name       string
+		target     string
+		opts       []cleanpath.Option
+		wantAllocs float64
+	}{
+		{name: "plain", target: pathABC},
+		{name: "root", target: "/"},
+		{name: "trailing", target: pathABTrail},
+		{name: "encoded", target: "/caf%C3%A9/a%2Fb"},
+		{name: "strip", target: pathAB, opts: []cleanpath.Option{cleanpath.WithTrailingSlash(cleanpath.StripSlash)}},
+		{name: "add", target: pathABTrail, opts: []cleanpath.Option{cleanpath.WithTrailingSlash(cleanpath.AddSlash)}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := cleanpath.Handler(tt.opts...)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, tt.target, http.NoBody)
+			rec := httptest.NewRecorder()
+			assert.InDelta(t, tt.wantAllocs, testing.AllocsPerRun(100, func() { h.ServeHTTP(rec, req) }), 0)
+		})
+	}
+}
+
+// runRewriteAllocations pins the cost of a rewrite: the request with its URL (one object) and the cleaned path.
+// It is sequential: [testing.AllocsPerRun] panics in parallel tests.
+func runRewriteAllocations(t *testing.T) {
+	t.Helper()
+	if racedetect.Enabled {
+		t.Skip("allocation counts mean nothing under the race detector; see task allocs")
+	}
+	tests := []struct {
+		name   string
+		target string
+		want   float64
+	}{
+		{name: "double slash", target: "//a/b", want: 2},
+		{name: "dot segment", target: pathDotInside, want: 2},
+		{name: "dotdot", target: "/a/../b", want: 2},
+		{name: "with a query", target: "//a/b?x=1", want: 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := cleanpath.Handler()(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, tt.target, http.NoBody)
+			rec := httptest.NewRecorder()
+			assert.InDelta(t, tt.want, testing.AllocsPerRun(100, func() { h.ServeHTTP(rec, req) }), 0)
+		})
+	}
+}
+
+// TestWithRejectHandler covers the handler that answers a rejected request.
+func TestWithRejectHandler(t *testing.T) {
+	t.Parallel()
+
+	teapot := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })
+	rejecting := []cleanpath.Option{cleanpath.WithMode(cleanpath.Reject), cleanpath.WithRejectHandler(teapot)}
+	tests := []struct {
+		name       string
+		target     string
+		opts       []cleanpath.Option
+		wantStatus int
+	}{
+		{name: "custom handler", opts: rejecting, target: pathDouble, wantStatus: http.StatusTeapot},
+		{name: "clean path passes", opts: rejecting, target: "/a/b", wantStatus: http.StatusOK},
+		{
+			name: "unused when rewriting", opts: []cleanpath.Option{cleanpath.WithRejectHandler(teapot)},
+			target: pathDouble, wantStatus: http.StatusOK,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			rec, _, _ := run(t, tt.target, http.MethodGet, tt.opts...)
+			assert.Equal(t, tt.wantStatus, rec.Code)
+		})
+	}
+}
+
+// assertSameOrigin checks that a redirect target is an absolute path on the same host: it parses without a host and
+// does not start with two slashes or a slash and a backslash, which a browser reads as another host.
+func assertSameOrigin(t *testing.T, loc string) {
+	t.Helper()
+	loc, _, _ = strings.Cut(loc, "?") // the query is the client's, and may hold anything
+	u, err := url.Parse(loc)
+	require.NoError(t, err)
+	assert.Empty(t, u.Host)
+	assert.Empty(t, u.Scheme)
+	assert.True(t, strings.HasPrefix(loc, "/"))
+	assert.False(t, strings.HasPrefix(loc, "//"))
+	assert.False(t, strings.HasPrefix(loc, "/\\"))
+	assert.NotContains(t, loc[:min(len(loc), 3)], "\t")
 }

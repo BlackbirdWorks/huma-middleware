@@ -2,6 +2,35 @@
 // gzip, negotiated from Accept-Encoding with its quality values. It only uses
 // the huma.Context interface.
 //
+// # Defaults
+//
+// [New] with no option is the recommended setup: the defaults below. The options
+// are overrides on top of it, one thing at a time; [DefaultConfig] returns the
+// defaults to read or to start from ([WithDefault]).
+//
+//   - Preference brotli, gzip, zstd: brotli compresses text best (about 20% smaller
+//     than gzip on JSON); gzip is understood by every client; zstd is the last
+//     resort for clients that only offer it.
+//   - Preference for JSON ("application/json", "+json") zstd, brotli, gzip: zstd
+//     is as small as gzip level 9 at a fraction of the cost, which suits
+//     responses built per request. The rule follows a fallback preference that
+//     includes zstd.
+//   - gzip level 6, the library default: the same ratio as level 9 at a sixth of
+//     the time, and 4% smaller than level 5 for 20% more time.
+//   - brotli level 5: levels 6 to 8 do not compress better and cost up to twice
+//     as much, level 4 is 12% bigger, and level 11 is 50 times slower.
+//   - zstd level 3, zstd's own default: levels 1 and 3 are within 3% of each
+//     other, level 9 is 7% smaller for 35% more time and four times the memory.
+//   - Minimum size 1024 bytes: about one TCP segment, so below it a response
+//     fits one packet whether compressed or not.
+//   - Content types: text, JSON, XML, JavaScript and the other text formats
+//     ("text/*", the "+json" and "+xml" suffixes, ...); never images (but SVG),
+//     video, audio, archives, PDF and fonts, which are compressed already, and
+//     never "text/event-stream": no wildcard matches it, it is compressed only
+//     when named exactly.
+//
+// The figures are from BenchmarkLevels on a JSON body and a text body (README).
+//
 // # Negotiation
 //
 // The coding with the highest q wins; ties go to the server preference. By
@@ -15,7 +44,7 @@
 // # Configuration
 //
 // A [Config] holds a preference order, compression levels by encoding, a minimum
-// size and a disabled flag. [WithDefault] sets the default one; [WithContentType]
+// size and a disabled flag. [WithDefault] sets the fallback one; [WithContentType]
 // sets one for a content type, which inherits what it leaves at the zero value.
 // The entry that matches a response is the most specific one: an exact type
 // ("application/json"), then a suffix ("+json", the longest), then a wildcard
@@ -71,7 +100,6 @@
 package compression
 
 import (
-	"compress/gzip"
 	"io"
 	"net/http"
 	"path"
@@ -117,6 +145,8 @@ type compressor struct {
 	def       *settings
 	exact     map[string]*settings
 	pools     map[poolKey]*encoderPool
+	allow     []string
+	respPool  sync.Pool
 	suffixes  []patternSettings
 	wildcards []patternSettings
 }
@@ -146,18 +176,10 @@ func New(opts ...Option) (Middleware, error) {
 	if err != nil {
 		return nil, err
 	}
-	builtin := &settings{
-		levels: Levels{
-			Gzip:   new(gzip.DefaultCompression),
-			Brotli: new(defaultBrotliLevel),
-			Zstd:   new(defaultZstdLevel),
-		},
-		pref:    []Encoding{Brotli, Gzip, Zstd},
-		minSize: defaultMinSize,
-	}
 	c := &compressor{
 		cfg:   cfg,
-		def:   overlay(builtin, cfg.def),
+		allow: allowList(cfg),
+		def:   overlay(defaultSettings(), cfg.def),
 		exact: map[string]*settings{},
 		pools: map[poolKey]*encoderPool{},
 	}
@@ -194,6 +216,12 @@ func New(opts ...Option) (Middleware, error) {
 			}
 		}
 	}
+	c.respPool.New = func() any {
+		r := &response{c: c}
+		r.collect = r.collectAccept
+
+		return r
+	}
 	c.bufPool.New = func() any {
 		b := make([]byte, 0, maxMin)
 
@@ -201,6 +229,15 @@ func New(opts ...Option) (Middleware, error) {
 	}
 
 	return c.handle, nil
+}
+
+// allowList returns the allow-list in force: the caller's, else the built-in one, built once.
+func allowList(cfg *config) []string {
+	if len(cfg.types) > 0 {
+		return cfg.types
+	}
+
+	return defaultAllowList()
 }
 
 // settingsFor returns the settings of a media type.
@@ -214,7 +251,7 @@ func (c *compressor) settingsFor(mt string) *settings {
 		}
 	}
 	for _, e := range c.wildcards {
-		if strings.HasPrefix(mt, e.pattern) {
+		if mt != eventStream && strings.HasPrefix(mt, e.pattern) {
 			return e.s
 		}
 	}
@@ -229,11 +266,8 @@ func (c *compressor) allowed(ct string) (*settings, bool) {
 	if mt == "" || alreadyCompressed(mt) || s.disabled {
 		return s, false
 	}
-	if s.explicit || (len(c.cfg.types) == 0 && isDefaultAllowed(mt)) {
-		return s, true
-	}
 
-	return s, slices.ContainsFunc(c.cfg.types, func(p string) bool { return matchType(p, mt) })
+	return s, s.explicit || slices.ContainsFunc(c.allow, func(p string) bool { return matchType(p, mt) })
 }
 
 // skipped reports whether the request is excluded before the response is known.
@@ -270,25 +304,34 @@ func globMatch(pattern, name string) bool {
 	return ok
 }
 
-// acceptEncoding returns the Accept-Encoding of the request with all its field
-// lines joined: they are one comma-separated list, but Header returns the first.
-func acceptEncoding(ctx huma.Context) string {
-	first := ctx.Header("Accept-Encoding")
-	if first == "" {
-		return ""
-	}
-	joined := first
-	count := 0
-	ctx.EachHeader(func(name, value string) {
-		if strings.EqualFold(name, "Accept-Encoding") {
-			count++
-			if count > 1 {
-				joined += ", " + value
-			}
-		}
-	})
+// acquire returns a response for the request, from the pool: it is reset here, not when released, so that a
+// late write by a handler that kept the writer finds the finished state until the object is reused.
+func (c *compressor) acquire(ctx huma.Context) *response {
+	r, _ := c.respPool.Get().(*response)
+	*r = response{c: c, collect: r.collect, base: ctx, sink: ctx.BodyWriter(), method: ctx.Method()}
 
-	return joined
+	return r
+}
+
+// acceptEncoding returns the Accept-Encoding of the request, read when it is needed: most responses that are
+// not compressed never ask. The field lines are one comma-separated list, but Header returns the first.
+func (r *response) acceptEncoding() string {
+	r.accept = r.base.Header("Accept-Encoding")
+	if r.accept != "" {
+		r.base.EachHeader(r.collect)
+	}
+
+	return r.accept
+}
+
+// collectAccept joins the Accept-Encoding field lines after the first one.
+func (r *response) collectAccept(name, value string) {
+	if len(name) == len("Accept-Encoding") && strings.EqualFold(name, "Accept-Encoding") {
+		r.acceptLines++
+		if r.acceptLines > 1 {
+			r.accept += ", " + value
+		}
+	}
 }
 
 func (c *compressor) handle(ctx huma.Context, next func(huma.Context)) {
@@ -297,24 +340,20 @@ func (c *compressor) handle(ctx huma.Context, next func(huma.Context)) {
 
 		return
 	}
-	r := &response{
-		base:   ctx,
-		c:      c,
-		sink:   ctx.BodyWriter(),
-		accept: acceptEncoding(ctx),
-		method: ctx.Method(),
-	}
+	r := c.acquire(ctx)
 	done := false
 	defer func() {
 		if !done {
-			r.abort()
+			r.abort() // a panic: the response is not reused, whatever still holds it
 		}
 	}()
 	next(r)
 	done = true
-	if !r.streaming {
-		r.finish()
+	if r.streaming {
+		return // a stream callback may outlive the handler: the response is not reused
 	}
+	r.finish()
+	c.respPool.Put(r)
 }
 
 type state int
@@ -335,29 +374,30 @@ type base huma.Context
 type response struct {
 	base
 
-	c      *compressor
-	sink   io.Writer
-	enc    encoder
-	pool   *encoderPool
-	bufp   *[]byte
-	method string
-	accept string
-
+	sink io.Writer
+	enc  encoder
+	// collect is collectAccept as a value, made once so that reading the header lines does not allocate.
+	collect         func(name, value string)
+	c               *compressor
+	pool            *encoderPool
+	bufp            *[]byte
 	set             *settings
-	contentType     string
 	contentEncoding string
+	contentLength   string
+	accept          string
+	contentType     string
+	method          string
 	cacheControl    string
 	etag            string
-	contentLength   string
-
-	status     int
-	state      state
-	statusSet  bool
-	hasLength  bool
-	streaming  bool
-	allowed    bool
-	hasETag    bool
-	varyListed bool
+	acceptLines     int
+	status          int
+	state           state
+	statusSet       bool
+	hasLength       bool
+	streaming       bool
+	allowed         bool
+	hasETag         bool
+	varyListed      bool
 }
 
 // SetStatus records the status; it is sent when the body starts.
@@ -394,33 +434,57 @@ func (r *response) AppendHeader(name, value string) {
 }
 
 func (r *response) track(name, value string, replace bool) {
-	switch {
-	case strings.EqualFold(name, "Content-Length"):
-		r.contentLength, r.hasLength = value, true
-
-		return
-	case strings.EqualFold(name, "ETag"):
-		r.etag, r.hasETag = value, true
-
-		return
-	case strings.EqualFold(name, "Content-Type"):
-		r.contentType = value
-	case strings.EqualFold(name, "Content-Encoding"):
-		r.contentEncoding = value
-	case strings.EqualFold(name, "Cache-Control"):
-		if replace || r.cacheControl == "" {
-			r.cacheControl = value
-		} else {
-			r.cacheControl += "," + value
+	// The name lengths tell the headers apart before any comparison: most headers are none of them.
+	held := false
+	switch len(name) {
+	case len("ETag"): // ETag, Vary
+		held = r.trackShort(name, value, replace)
+	case len("Content-Type"):
+		if strings.EqualFold(name, "Content-Type") {
+			r.contentType = value
 		}
-	case strings.EqualFold(name, "Vary"):
-		listed := varyListsAcceptEncoding(value)
-		r.varyListed = listed || (!replace && r.varyListed)
+	case len("Cache-Control"):
+		if strings.EqualFold(name, "Cache-Control") {
+			r.trackCacheControl(value, replace)
+		}
+	case len("Content-Length"):
+		if strings.EqualFold(name, "Content-Length") {
+			r.contentLength, r.hasLength, held = value, true, true
+		}
+	case len("Content-Encoding"):
+		if strings.EqualFold(name, "Content-Encoding") {
+			r.contentEncoding = value
+		}
+	}
+	if held {
+		return
 	}
 	if replace {
 		r.base.SetHeader(name, value)
 	} else {
 		r.base.AppendHeader(name, value)
+	}
+}
+
+// trackShort watches ETag, which is held back, and Vary.
+func (r *response) trackShort(name, value string, replace bool) bool {
+	switch {
+	case strings.EqualFold(name, "ETag"):
+		r.etag, r.hasETag = value, true
+
+		return true
+	case strings.EqualFold(name, "Vary"):
+		r.varyListed = varyListsAcceptEncoding(value) || (!replace && r.varyListed)
+	}
+
+	return false
+}
+
+func (r *response) trackCacheControl(value string, replace bool) {
+	if replace || r.cacheControl == "" {
+		r.cacheControl = value
+	} else {
+		r.cacheControl += "," + value
 	}
 }
 
@@ -611,7 +675,7 @@ func (r *response) plan(size int) (Encoding, bool, bool) {
 	case size == 0 || size < set.minSize:
 		return "", false, true
 	}
-	enc, ok := Negotiate(r.accept, set.pref)
+	enc, ok := Negotiate(r.acceptEncoding(), set.pref)
 
 	return enc, ok, true
 }

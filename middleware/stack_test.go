@@ -14,14 +14,15 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	"github.com/blackbirdworks/huma-middleware/middleware/accesslog"
 	"github.com/blackbirdworks/huma-middleware/middleware/cleanpath"
 	"github.com/blackbirdworks/huma-middleware/middleware/logging"
 	"github.com/blackbirdworks/huma-middleware/middleware/tracing"
 )
 
-// TestStackedPlainHandlersAgreeOnTheRoute stacks the net/http forms in both orders: the router sets the pattern
+// TestStack stacks the net/http forms in both orders: the router sets the pattern
 // on the innermost request copy, and every layer must still see the route.
-func TestStackedPlainHandlersAgreeOnTheRoute(t *testing.T) {
+func TestStack(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -41,14 +42,16 @@ func TestStackedPlainHandlersAgreeOnTheRoute(t *testing.T) {
 			tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
 			reader := sdkmetric.NewManualReader()
 			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-			var rec logging.Record
+			var rec accesslog.Record
 			trace := func(next http.Handler) http.Handler {
 				return tracing.Handler(next, tracing.WithTracerProvider(tp), tracing.WithMeterProvider(mp))
 			}
 			logs := func(next http.Handler) http.Handler {
-				return logging.Handler(next,
-					logging.WithLogger(slog.New(slog.DiscardHandler)),
-					logging.WithAccessLogFunc(func(_ context.Context, _ *slog.Logger, r logging.Record) { rec = r }))
+				access := accesslog.Handler(
+					accesslog.WithLogger(slog.New(slog.DiscardHandler)),
+					accesslog.WithRecordFunc(func(_ context.Context, _ *slog.Logger, r *accesslog.Record) { rec = *r }))
+
+				return logging.Handler(access(next), logging.WithLogger(slog.New(slog.DiscardHandler)))
 			}
 			mux := http.NewServeMux()
 			mux.HandleFunc("GET /raw/{id}", func(http.ResponseWriter, *http.Request) {})

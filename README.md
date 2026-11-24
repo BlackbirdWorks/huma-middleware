@@ -7,7 +7,8 @@ own package, so an application links only the dependencies of the ones it uses.
 | --- | --- | --- |
 | `middleware/cleanpath` | Cleans the request path (`//a/../b` to `/b`) before routing | `net/http` middleware, in front of the router |
 | `middleware/tracing` | OpenTelemetry server spans and HTTP server metrics, through `otelhttp` | huma middleware |
-| `middleware/logging` | Request-scoped `log/slog` logger and an access log | huma middleware |
+| `middleware/logging` | Request-scoped `log/slog` logger in the context, with enrichment | huma middleware |
+| `middleware/accesslog` | One allocation-free access log record per request | huma middleware |
 | `middleware/recovery` | Recovers panics: logs them, marks the span, answers 500 | huma middleware |
 | `middleware/compression` | zstd, brotli and gzip response compression | huma middleware |
 
@@ -110,7 +111,7 @@ seen, wrap those with `tracing.Handler`.
 
 ## logging
 
-A request-scoped `log/slog` logger in the context, and one access log record per request.
+A request-scoped `log/slog` logger in the context. It writes no access log: that is `accesslog`.
 
 <!-- example: logging ExampleNew -->
 ```go
@@ -137,33 +138,103 @@ func ExampleNew() {
 	mux.ServeHTTP(httptest.NewRecorder(), req)
 	// Output:
 	// level=INFO msg="loading user" req=abc method=GET route=/users
-	// level=INFO msg=request req=abc path=/users status=204 method=GET route=/users
 }
 ```
 
 The logger in the context carries `method`, `route`, `operation_id`, `request_id` (header `X-Request-ID`) and, when a
 span is in the context, `trace_id` and `span_id`; the attributes are added when a record is handled, so a disabled
-level costs nothing. After the response one access log record is written: path (never the query string), status
-actually sent, duration, response size, remote address and user agent, at Info, Warn for 4xx, Error for 5xx.
-`logging.FromContext(ctx)` returns the request logger (or `slog.Default()`); `logging.AddAttrs(ctx, attrs...)` adds
-attributes later in the request (for example once the user is authenticated), to the logs written afterwards and to
-the access log. `logging.Handler(next, opts...)` is the form for plain routes.
+level costs nothing. `logging.FromContext(ctx)` returns the request logger (or `slog.Default()`); `logging.NewContext`
+puts a logger in a context (tests, background work); `logging.AddAttrs(ctx, attrs...)` adds attributes later in the
+request (for example once the user is authenticated), to the logs written afterwards and to the access log record.
+`logging.Handler(next, opts...)` is the form for plain routes.
 
-Options: `WithLogger` (nil or absent means `slog.Default()`, resolved on every request), `WithFields` (rename
-attributes), `WithLevels`, `WithClock`, `WithMessage`, `WithSkip(fn)` (skips the access log), `WithoutAccessLog`,
-`WithAccessAttrs(fn)`, `WithHeaders(names...)` with `WithRedactedHeaders(names...)` (Authorization, cookies and API key
-headers are redacted by default), `WithRequestIDHeader(name)` (the request's ID, else the same header of the response: an ID an outer wrapper set,
-then the one on the response when the record is written; `Record.RequestID` is the resolved one),
-`WithRequestIDGenerator(fn)` (creates the ID last, when neither side has one, and sets it on the response; the huma form
-cannot see a header an outer middleware set earlier), `WithoutRequestAttrs`, `WithEnrichLogs(fn)` (called once per
-request, before the handlers; the returned logger is used for handler logs and the access log; several are applied in
-order; a panic in `fn` propagates) and `WithAccessLogFunc(fn)`, which replaces the access log record entirely with
-your own function and a `Record`, for applications that must keep an existing log format. `Record.Header` and
-`Record.RequestURI` read the request: call them before your function returns.
+Options: `WithLogger` (nil or absent means `slog.Default()`, resolved on every request), `WithFields` (rename the
+request attributes), `WithRequestIDHeader(name)`, `WithoutRequestAttrs`, `WithEnrichLogs(fn)` (called once per request,
+before the handlers; the returned logger is the one in the context; several are applied in order; a panic in `fn`
+propagates) and `WithRequestEnrichLogs(fn)` for `Handler`. The enrich function sees what is in the context when the
+logging middleware runs; put authentication before it, or use `AddAttrs`. The cost is one allocation per request (the
+request state, which is also the context handed on) and the logger when it is first asked for.
 
-The enrich function sees what is in the context when the logging middleware runs; put authentication before it, or use
-`AddAttrs`. On adapters that stream through a callback (Fiber) the access log is written when the handler returns, before
-the stream ends.
+## accesslog
+
+One access log record per request, after the response, without allocating: no context value, no request copy, no
+per-request logger or closure. The state of a request (the response wrapper, the byte counter and the log record) is
+pooled, the level is checked first (a disabled level costs nothing more), and the attributes are typed.
+
+<!-- example: accesslog ExampleNew -->
+```go
+func ExampleNew() {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{ReplaceAttr: dropNoise}))
+
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("example", "1.0.0"))
+	// accesslog.New() alone logs to slog.Default().
+	api.UseMiddleware(accesslog.New(accesslog.WithLogger(logger)))
+	huma.Get(api, "/users", func(context.Context, *struct{}) (*struct{}, error) { return &struct{}{}, nil })
+
+	mux.ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/users?secret=1", http.NoBody))
+	// Output: level=INFO msg=request method=GET path=/users status=204 route=/users
+}
+```
+
+The record has `method`, `path` (never the query string), `route`, `operation_id`, `status` actually sent, `duration`,
+`response_size` (what was handed to the writer, the compressed size when compression runs inside), `remote_addr`,
+`user_agent` and `request_id`, at Info, Warn for 4xx, Error for 5xx. `accesslog.Handler(opts...)(next)` is the form for
+plain routes (the route is the `ServeMux` pattern).
+
+Options: `WithLogger` (nil or absent means `slog.Default()`, resolved on every request), `WithFields`, `WithLevels`,
+`WithClock`, `WithMessage`, `WithSkip(fn)` and `WithRequestSkip(fn)`, `WithAttrs(fn)` (extra attributes),
+`WithHeaders(names...)` with `WithRedactedHeaders(names...)` (Authorization, cookies and API key headers are redacted by
+default), `WithRequestIDHeader(name)` (the request's ID, else the same header of the response when the record is
+written) and `WithRequestIDGenerator(fn)` (creates the ID when the request has none and sets it on the response), and
+`WithRetainedRecords` (for a log handler that keeps the record after `Handle` returns, as an asynchronous one does: the
+attribute slices are allocated per record instead of pooled), and `WithRecordFunc(fn)`, which replaces the record entirely with your own function, for applications that must keep an
+existing log format:
+
+<!-- example: accesslog ExampleWithRecordFunc -->
+```go
+func ExampleWithRecordFunc() {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{ReplaceAttr: dropNoise}))
+
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("example", "1.0.0"))
+	api.UseMiddleware(accesslog.New(
+		accesslog.WithLogger(logger),
+		accesslog.WithRecordFunc(func(ctx context.Context, l *slog.Logger, r *accesslog.Record) {
+			l.LogAttrs(ctx, slog.LevelInfo, "Success",
+				slog.String("request", r.Method+" "+r.RequestURI()),
+				slog.Int("status", r.Status),
+				slog.Int64("size", r.Size),
+			)
+		}),
+	))
+	huma.Get(api, "/ping", func(context.Context, *struct{}) (*struct{}, error) { return &struct{}{}, nil })
+
+	mux.ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/ping?a=1", http.NoBody))
+	// Output: level=INFO msg=Success request="GET /ping?a=1" status=204 size=0
+}
+```
+
+The `*Record` your function receives is pooled state: use it during the call and copy what you keep (`Record.Header` and
+`Record.RequestURI` read the request, call them before the function returns). `WithHeaders`, `WithAttrs`,
+`WithRecordFunc` and `WithRequestIDGenerator` allocate what their feature needs, only when used. What the log handler
+allocates to format the record is the handler's: `slog.JSONHandler` and `slog.TextHandler` allocate, a handler that does
+not (as the tests use) shows the middleware adds none.
+
+On adapters that stream through a callback (Fiber) the record is written when the handler returns, before the stream
+ends.
+
+### With `logging`
+
+Install `logging` outside `accesslog` (before it in `UseMiddleware`). The record is then written to the root logger of
+`logging` with its enrichers' additions, carries the attributes added with `logging.AddAttrs` and the `trace_id` and
+`span_id`, and the request ID `accesslog` generated is the one the request logger shows. Installed the other way round,
+or alone, each works as if the other were not there (the record has no late attributes and no trace IDs; the handler
+logs have no generated request ID). The request logger learns an ID that `accesslog` generated when the handler runs,
+so a logger an enricher grouped with `WithGroup` (its request attributes are bound at that point) does not show it, and
+it does not see a response header a handler sets; the access record does. The two packages do not import each other.
 
 ## recovery
 
@@ -199,12 +270,96 @@ and, if nothing was written yet (a final status, a body write or a flush counts 
 
 ## compression
 
-zstd, brotli and gzip, negotiated from `Accept-Encoding`.
+zstd, brotli and gzip, negotiated from `Accept-Encoding`. **`compression.New()` with no option is the recommended setup**;
+the options are overrides on top of it, one thing at a time.
 
 <!-- example: compression ExampleNew -->
 ```go
 func ExampleNew() {
-	// compression.New() alone compresses text and JSON, zstd for JSON, then br, then gzip.
+	// No option is the recommended setup: text and JSON are compressed, zstd first for JSON, then br, then gzip.
+	mw, err := compression.New()
+	if err != nil {
+		panic(err)
+	}
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("example", "1.0.0"))
+	api.UseMiddleware(mw)
+	huma.Get(api, "/items", func(context.Context, *struct{}) (*struct{ Body []string }, error) {
+		return &struct{ Body []string }{Body: strings.Split(strings.Repeat("item ", 400), " ")}, nil
+	})
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/items", http.NoBody)
+	req.Header.Set("Accept-Encoding", "gzip, br, zstd")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	fmt.Println(rec.Header().Get("Content-Encoding"), rec.Header().Get("Vary"))
+	// Output: zstd Accept-Encoding
+}
+```
+
+### Defaults
+
+| Setting | Default | Why |
+| --- | --- | --- |
+| Preference | brotli, gzip, zstd | brotli compresses text best (about 20% smaller than gzip on JSON), gzip is understood everywhere, zstd is the last resort for clients that only offer it |
+| Preference for JSON (`application/json`, `+json`) | zstd, brotli, gzip | zstd is as small as gzip level 9 at a fraction of the cost, which suits responses built per request; the rule follows a fallback preference that includes zstd |
+| gzip level | 6 (the library default) | the same ratio as level 9 at a sixth of the time on JSON; level 5 is 4% bigger |
+| brotli level | 5 | the knee of the curve: levels 6 to 8 do not compress better and cost up to twice as much, level 4 is 12% bigger, level 11 is 50 times slower |
+| zstd level | 3 (zstd's default) | levels 1 and 3 are within 3% of each other; level 9 is 7% smaller for 35% more time and four times the memory |
+| Minimum size | 1024 bytes | about one TCP segment: below it a response fits one packet whether compressed or not |
+| Content types | text, JSON, XML, JavaScript, ... (`text/*`, `+json`, `+xml`, ...) | what shrinks well. Never images (but SVG), video, audio, archives, PDF, fonts (compressed already), and never `text/event-stream` (a stream must reach the client as it is written; no wildcard matches it, it is compressed only when named exactly) |
+
+The levels come from `BenchmarkLevels` (`task bench`): a 19 KB JSON list of records and a 15 KB HTML text, median of 5 runs
+on a 3-core machine. Ratio is compressed size over original; the times are relative (they vary between machines).
+
+| Level | JSON ratio | JSON time | HTML ratio | HTML time |
+| --- | --- | --- | --- | --- |
+| gzip 1 | 0.159 | 102 us | 0.176 | 43 us |
+| gzip 5 | 0.133 | 235 us | 0.156 | 81 us |
+| **gzip 6** | **0.128** | 107 us | **0.157** | 93 us |
+| gzip 9 | 0.128 | 760 us | 0.153 | 328 us |
+| brotli 4 | 0.117 | 516 us | 0.160 | 226 us |
+| **brotli 5** | **0.105** | 605 us | **0.146** | 278 us |
+| brotli 8 | 0.105 | 465 us | 0.147 | 362 us |
+| brotli 11 | 0.085 | 29.8 ms | 0.133 | 23.2 ms |
+| zstd 1 | 0.120 | 49 us | 0.172 | 42 us |
+| **zstd 3** | **0.117** | 56 us | **0.160** | 55 us |
+| zstd 9 | 0.109 | 76 us | 0.158 | 74 us |
+
+`DefaultConfig()` returns the fallback configuration with every field set (a new value on each call). To start from the
+defaults and change one thing, pass the changed copy to `WithDefault`; the built-in rule for JSON stays with it:
+
+<!-- example: compression ExampleDefaultConfig -->
+```go
+func ExampleDefaultConfig() {
+	// Start from the defaults and change one thing: compress smaller bodies too.
+	cfg := compression.DefaultConfig()
+	cfg.MinSize = 16
+	mw, err := compression.New(compression.WithDefault(cfg))
+	if err != nil {
+		panic(err)
+	}
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("example", "1.0.0"))
+	api.UseMiddleware(mw)
+	huma.Get(api, "/items", func(context.Context, *struct{}) (*struct{ Body []string }, error) {
+		return &struct{ Body []string }{Body: strings.Split(strings.Repeat("item ", 10), " ")}, nil
+	})
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/items", http.NoBody)
+	req.Header.Set("Accept-Encoding", "gzip, zstd")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	fmt.Println(rec.Header().Get("Content-Encoding")) // JSON keeps preferring zstd
+	// Output: zstd
+}
+```
+
+### Your own configuration
+
+<!-- example: compression ExampleWithSkipPathPrefixes -->
+```go
+func ExampleWithSkipPathPrefixes() {
 	mw, err := compression.New(
 		compression.WithDefault(compression.Config{MinSize: 1}), // compress even tiny bodies here
 		compression.WithContentType("text/html", compression.Config{
@@ -219,7 +374,9 @@ func ExampleNew() {
 	mux := http.NewServeMux()
 	api := humago.New(mux, huma.DefaultConfig("example", "1.0.0"))
 	api.UseMiddleware(mw)
-	huma.Get(api, "/items", func(context.Context, *struct{}) (*listOut, error) { return &listOut{}, nil })
+	huma.Get(api, "/items", func(context.Context, *struct{}) (*struct{ Body []string }, error) {
+		return &struct{ Body []string }{Body: []string{"a"}}, nil
+	})
 
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/items", http.NoBody)
 	req.Header.Set("Accept-Encoding", "gzip, br, zstd")
@@ -230,20 +387,19 @@ func ExampleNew() {
 }
 ```
 
-Defaults: zstd for JSON (`application/json`, `+json`) when the client accepts it, otherwise brotli, then gzip (zstd is the
-last resort for other types). The client's quality values come first (`q=0` excludes, `*` and `identity` are
-understood; a header split over several lines is read as one list); the server preference breaks ties.
+The client's quality values come first (`q=0` excludes, `*` and `identity` are understood; a header split over several
+lines is read as one list); the server preference breaks ties.
 
-Configuration is one default `Config` (`WithDefault`) plus optional per-content-type configs (`WithContentType`). A
+Configuration is one fallback `Config` (`WithDefault`) plus optional per-content-type configs (`WithContentType`). A
 `Config` has `Preference` (order), `Levels` (`compression.Levels{Gzip, Brotli, Zstd}`, each a pointer written with `new(n)`, so that level 0 is selectable: gzip -2 to 9, brotli 0 to 11, zstd 1 to 22; nil keeps the default), `MinSize`
-(default 1024) and `Disabled`; a content type's config inherits what it leaves at the zero value. The entry for a
+(1024 by default) and `Disabled`; a content type's config inherits what it leaves at the zero value. The entry for a
 response is the most specific match: exact (`application/json`), then suffix (`+json`, the longest), then wildcard
 (`text/*`, the longest; `*/*` last), then the default. An entry also makes its type compressible. Encoder pools are keyed
 by encoding and level. Invalid configuration is an error from `New`.
 
-Other options: `WithContentTypes(patterns...)` (the allow-list; default text, JSON, XML, JavaScript and similar),
-`WithSkipPathPrefixes`, `WithSkipPathPatterns`, `WithOnlyPathPrefixes`, `WithSkipOperations`, `WithSkip(fn)`. Images
-other than SVG, video, audio, archives, PDF and fonts are never compressed.
+Other options: `WithContentTypes(patterns...)` (the allow-list, replacing the default one), `WithSkipPathPrefixes`,
+`WithSkipPathPatterns`, `WithOnlyPathPrefixes`, `WithSkipOperations`, `WithSkip(fn)`. Images other than SVG, video, audio,
+archives, PDF and fonts are never compressed.
 
 Headers: `Content-Encoding` is set; `Content-Length` is not sent for a compressed body; `Vary: Accept-Encoding` is
 appended to the handler's `Vary` (once) on every response that could be compressed, including those that are not
@@ -307,6 +463,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
 
+	"github.com/blackbirdworks/huma-middleware/middleware/accesslog"
 	"github.com/blackbirdworks/huma-middleware/middleware/cleanpath"
 	"github.com/blackbirdworks/huma-middleware/middleware/compression"
 	"github.com/blackbirdworks/huma-middleware/middleware/logging"
@@ -328,6 +485,7 @@ func main() {
 	api.UseMiddleware(
 		tracing.New(),
 		logging.New(logging.WithLogger(logger)),
+		accesslog.New(accesslog.WithLogger(logger)),
 		recovery.New(api),
 		compress,
 	)
@@ -342,26 +500,116 @@ func main() {
 
 ### Order
 
-`cleanpath` (outermost, `net/http`) then `tracing`, `logging`, `recovery`, `compression` (huma, outermost first).
+`cleanpath` (outermost, `net/http`) then `tracing`, `logging`, `accesslog`, `recovery`, `compression` (huma, outermost first).
 
 - **cleanpath first**: every later layer, including path based access rules, sees the same cleaned path, so
   `/public/../admin` cannot slip past a rule that matches `/admin`. Requests that never reach huma (404, 405, raw
   `net/http` routes) are cleaned too.
 - **tracing before logging**: the span exists when logging reads the trace and span IDs, and the span covers the whole
   request.
-- **logging before recovery**: the recovered panic is logged with the request attributes, and the access log records the
-  500 that recovery wrote.
+- **logging before accesslog**: the access record carries what the request logger knows (enrichment, `AddAttrs`, trace
+  and span IDs). **accesslog before recovery**: the recovered panic is logged with the request attributes, and the
+  access log records the 500 that recovery wrote.
 - **recovery inside tracing and logging, outside the handlers**: it recovers before the panic crosses them. What each
   combination records:
   - recovery inside tracing (above): recovery marks the span (exception `*recovery.PanicError`), writes the 500, and
     tracing and its metrics see the 500 as a normal response;
   - recovery outside tracing: tracing records the panic on the span first (exception `*tracing.PanicError`, status 500,
     the 500 also in the metrics) and raises it again; recovery logs it and answers; the span is not marked twice;
-  - recovery outside logging: the panic crosses logging, which writes no access log record for that request.
+  - recovery outside accesslog: the panic crosses it, and no access log record is written for that request.
 - **compression innermost**: it wraps the handler's response, and everything outside it sees the final status and the
-  bytes actually sent (the access log counts the compressed size).
-- **authentication**: before `logging` when the log should carry the user, or call `logging.AddAttrs(ctx, ...)` once the
+  bytes actually sent (`accesslog` counts the compressed size).
+- **authentication**: before `logging` when the logs should carry the user, or call `logging.AddAttrs(ctx, ...)` once the
   user is known.
+
+## Performance
+
+What each middleware adds to a request, measured against the same API without it (`bare/*`: huma on `net/http`, 5
+allocations and about 440 ns per request, which is huma's own). The numbers are from `BenchmarkPerf` in `middleware/`
+(`task bench`): test binaries built once for v0.1.0 and for this version, run alternately on two pinned cores, one CPU,
+10 runs each, medians below (`benchstat` on the same runs says every difference marked here is significant). The bare
+rows differ by about 4% between the two binaries (the same huma code): read the ns column with that offset, the
+allocation columns are exact.
+
+| Case | v0.1.0 | this version | ns | allocs v0.1.0 | allocs now | B/op v0.1.0 | B/op now |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `bare/tiny` | 426 ns | 447 ns | +5% | 5 | 5 | 144 | 144 |
+| `bare/big` | 428 ns | 443 ns | +4% | 5 | 5 | 144 | 144 |
+| `bare/encoded` | 544 ns | 567 ns | +4% | 7 | 7 | 160 | 160 |
+| `tracing/disabled` | 436 ns | 462 ns | +6% | 5 | 5 | 144 | 144 |
+| `tracing/filtered` | 443 ns | 473 ns | +7% | 5 | 5 | 144 | 144 |
+| `tracing/enabled-noop` | 4.81 µs | 4.92 µs | +2% | 37 | 37 | 3616 | 3616 |
+| `tracing/recording` | 6.61 µs | 6.76 µs | +2% | 41 | 41 | 6913 | 6913 |
+| `accesslog/info-nop-handler` | 1.61 µs | 994 ns | -38% | 12 | 5 | 960 | 144 |
+| `accesslog/info-json` | 2.83 µs | 1.99 µs | -30% | 12 | 5 | 960 | 144 |
+| `accesslog/level-off` | 957 ns | 725 ns | -24% | 9 | 5 | 512 | 144 |
+| `accesslog/skipped` | 819 ns | 609 ns | -26% | 9 | 5 | 512 | 144 |
+| `accesslog/net-http-info-nop-handler` | 1.92 µs | 977 ns | -49% | 16 | 5 | 1312 | 144 |
+| `accesslog/net-http-info-json` | 3.12 µs | 1.98 µs | -37% | 16 | 5 | 1312 | 144 |
+| `accesslog/net-http-level-off` | 1.30 µs | 742 ns | -43% | 13 | 5 | 896 | 144 |
+| `logging/request-state` | 814 ns | 661 ns | -19% | 9 | 6 | 512 | 496 |
+| `logging/net-http-request-state` | 1.05 µs | 759 ns | -28% | 12 | 7 | 880 | 816 |
+| `logging+accesslog/info-nop-handler` | 1.61 µs | 1.24 µs | -23% | 12 | 6 | 960 | 496 |
+| `logging+accesslog/info-json` | 2.84 µs | 2.45 µs | -13% | 12 | 6 | 960 | 496 |
+| `recovery/no-panic` | 487 ns | 508 ns | +4% | 6 | 5 | 192 | 144 |
+| `compression/not-accepted` | 860 ns | 757 ns | -12% | 7 | 6 | 384 | 160 |
+| `compression/not-compressible` | 859 ns | 612 ns | -29% | 9 | 5 | 416 | 144 |
+| `compression/below-min` | 1.02 µs | 754 ns | -26% | 10 | 6 | 432 | 160 |
+| `compression/skipped` | 445 ns | 471 ns | +6% | 5 | 5 | 144 | 144 |
+| `compression/gzip-2k` | 10.65 µs | 10.29 µs | -3% | 11 | 7 | 512 | 238 |
+| `compression/gzip-20k` | 53.32 µs | 53.06 µs | -0% | 11 | 7 | 771 | 497 |
+| `compression/brotli-20k` | 28.20 µs | 30.95 µs | +10% | 11 | 7 | 686 | 430 |
+| `compression/zstd-20k` | 11.10 µs | 10.90 µs | -2% | 11 | 7 | 559 | 284 |
+| `compression/stream-gzip` | 28.87 µs | 28.28 µs | -2% | 11 | 7 | 602 | 326 |
+| `compression/stream-passthrough` | 905 ns | 757 ns | -16% | 7 | 6 | 352 | 128 |
+| `bare/stream` | 456 ns | 467 ns | +2% | 5 | 5 | 112 | 112 |
+| `cleanpath/clean` | 468 ns | 501 ns | +7% | 5 | 5 | 144 | 144 |
+| `cleanpath/encoded-clean` | 618 ns | 621 ns | +1% | 8 | 7 | 168 | 160 |
+| `cleanpath/rewrite` | 860 ns | 769 ns | -11% | 9 | 7 | 664 | 600 |
+| `chain/tiny` | 9.36 µs | 8.74 µs | -7% | 50 | 39 | 4769 | 3986 |
+| `chain/big-gzip` | 64.52 µs | 63.74 µs | -1% | 51 | 40 | 5137 | 4354 |
+| `chain/big-zstd` | 21.74 µs | 20.97 µs | -4% | 51 | 40 | 4987 | 4196 |
+| `chain-tracing-off/tiny` | 3.71 µs | 3.06 µs | -18% | 18 | 7 | 1296 | 512 |
+
+How to read it, per middleware (allocations on top of `bare`):
+
+- `accesslog` adds **0** allocations in both forms, when the record is written, when its level is off and when the
+  request is skipped (`TestAllocs` pins this against a handler that does not allocate; `slog.JSONHandler` and
+  `slog.TextHandler` allocate when they format, that is theirs). v0.1.0's access log added 4 to 11 per request.
+- `logging` adds 1: the request state, which is also the context handed on (the logger is made when first asked for, +1).
+- `recovery` adds 0 when nothing panics.
+- `compression` adds 0 when the request is skipped, not compressible or below the minimum size, 1 for the `Vary`
+  header when it is not accepted, and 2 when compressing (the encoder state is pooled; the library's own writes remain).
+- `cleanpath` adds 0 on a clean path, including an encoded one, and 2 on a rewrite (the request copy and the new path).
+- `tracing` adds 0 when disabled or filtered. An enabled middleware adds 32 in all: 4 of its own, which its
+  design needs (the context value, the request copy handed to otelhttp and huma's two context wrappers), and the rest
+  `otelhttp`'s.
+
+Every pool has a parallel `-race` test, the allocation pins skip under the race detector and run in `task allocs`
+(also in CI).
+
+## Upgrading from v0.1.0
+
+`logging` was split: it keeps the request logger, and the access log is the new `accesslog` package. Nothing is
+deprecated, the access log options are gone from `logging`.
+
+| v0.1.0 | Now |
+| --- | --- |
+| `logging.New(opts...)`: logger and access log | `logging.New(...)` and `accesslog.New(...)`, in this order |
+| `logging.Handler(next, opts...)` | `logging.Handler(accesslog.Handler(accessOpts...)(next), logOpts...)` |
+| `WithLogger`, `WithRequestIDHeader` | the same in both packages (`logging`: the `request_id` of its logger; `accesslog`: the record) |
+| `WithEnrichLogs`, `WithRequestEnrichLogs`, `WithoutRequestAttrs`, `FromContext`, `NewContext`, `AddAttrs` | unchanged, in `logging` |
+| `WithFields(Fields)` | `logging.WithFields` for `Method`, `Route`, `OperationID`, `RequestID`, `TraceID`, `SpanID`; `accesslog.WithFields` for the names of the record |
+| `WithLevels`, `Levels`, `DefaultLevels`, `DefaultFields`, `WithClock`, `WithMessage`, `WithHeaders`, `WithRedactedHeaders`, `WithRequestIDGenerator` | the same names in `accesslog` |
+| `WithSkip`, `WithRequestSkip` | the same names in `accesslog` (they skip the record) |
+| `WithAccessAttrs(func(Record) []slog.Attr)` | `accesslog.WithAttrs(func(*Record) []slog.Attr)` |
+| `WithAccessLogFunc(func(ctx, *slog.Logger, Record))` | `accesslog.WithRecordFunc(func(ctx, *slog.Logger, *Record))`: the `*Record` is pooled, copy what you keep |
+| `WithoutAccessLog` | do not install `accesslog` |
+| `logging.Record` | `accesslog.Record` (a pointer) |
+
+Behaviour: the access record carries the enrichers' additions, the `AddAttrs` attributes and the trace IDs only when
+`logging` is installed outside `accesslog`. A request ID that `accesslog` generated is shown by the request logger only
+then too, and the request logger no longer follows a response header that a handler sets (the access record does). In `compression`, a wildcard (`text/*`, `*/*`) no longer matches `text/event-stream`: only its exact name does.
 
 ## Development
 
