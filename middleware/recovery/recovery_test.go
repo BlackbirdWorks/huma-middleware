@@ -540,3 +540,70 @@ func TestPanicErrorMessage(t *testing.T) {
 		})
 	}
 }
+
+func TestHandlerInterimStatusAndHijack(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		next       http.HandlerFunc
+		name       string
+		wantStatus int
+	}{
+		{
+			name: "an early hint does not count as a started response", wantStatus: http.StatusInternalServerError,
+			next: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusEarlyHints)
+				panic("boom")
+			},
+		},
+		{
+			name: "101 does", wantStatus: http.StatusSwitchingProtocols,
+			next: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusSwitchingProtocols)
+				panic("boom")
+			},
+		},
+		{
+			name: "a hijack attempt counts as a started response: no 500 is written over it", wantStatus: 0,
+			next: func(w http.ResponseWriter, _ *http.Request) {
+				_, _, err := http.NewResponseController(w).Hijack()
+				assert.ErrorIs(t, err, http.ErrNotSupported)
+				panic("boom")
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			logger, _ := newLogger()
+			h := recovery.Handler(recovery.WithLogger(logger))(tt.next)
+			rec := &statusRecorder{ResponseRecorder: httptest.NewRecorder()}
+			_, p := get2(h, rec)
+			require.Nil(t, p)
+			assert.Equal(t, tt.wantStatus, rec.last)
+		})
+	}
+}
+
+// statusRecorder keeps the last status written, informational ones included.
+type statusRecorder struct {
+	*httptest.ResponseRecorder
+
+	last int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.last = code
+	s.ResponseRecorder.WriteHeader(code)
+}
+
+func get2(h http.Handler, w http.ResponseWriter) (http.ResponseWriter, any) {
+	var panicValue any
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/x", http.NoBody)
+	func() {
+		defer func() { panicValue = recover() }()
+		h.ServeHTTP(w, req)
+	}()
+
+	return w, panicValue
+}

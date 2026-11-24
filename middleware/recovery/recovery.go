@@ -33,10 +33,12 @@
 package recovery
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"runtime"
 
@@ -227,6 +229,12 @@ func Handler(opts ...Option) func(http.Handler) http.Handler {
 	}
 }
 
+// interim reports whether the status is informational (103 Early Hints): not the final one.
+// 101 Switching Protocols ends the exchange and is final.
+func interim(code int) bool {
+	return code >= http.StatusContinue && code < http.StatusOK && code != http.StatusSwitchingProtocols
+}
+
 // trackWriter remembers whether the response was started.
 type trackWriter struct {
 	http.ResponseWriter
@@ -235,8 +243,16 @@ type trackWriter struct {
 }
 
 func (w *trackWriter) WriteHeader(code int) {
-	w.wrote = true
+	// An informational status (103 Early Hints) does not start the final response.
+	w.wrote = w.wrote || !interim(code)
 	w.ResponseWriter.WriteHeader(code)
+}
+
+// Hijack lets handlers take over the connection (upgrades) when the underlying writer allows it.
+func (w *trackWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	w.wrote = true
+
+	return http.NewResponseController(w.ResponseWriter).Hijack() //nolint:wrapcheck // the writer's own error
 }
 
 func (w *trackWriter) Write(p []byte) (int, error) {

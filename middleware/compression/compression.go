@@ -79,6 +79,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 )
@@ -431,6 +432,23 @@ func (r *response) StreamBody(fn func(io.Writer)) {
 		fn(r)
 		r.finish()
 	})
+}
+
+// Unwrap returns the context this one wraps, which adapters' Unwrap helpers
+// (humago.Unwrap, humachi.Unwrap) follow to reach the request and the writer.
+func (r *response) Unwrap() huma.Context { return r.base }
+
+// SetWriteDeadline forwards to the writer under the response, so huma's SSE
+// support can still apply its per-send write timeout through the compressed body writer.
+func (r *response) SetWriteDeadline(t time.Time) error {
+	if d, ok := r.sink.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		return d.SetWriteDeadline(t) //nolint:wrapcheck // the writer's own error
+	}
+	if rw, ok := r.sink.(http.ResponseWriter); ok {
+		return http.NewResponseController(rw).SetWriteDeadline(t) //nolint:wrapcheck // the writer's own error
+	}
+
+	return http.ErrNotSupported
 }
 
 // BodyWriter returns the writer the handler writes the body to.
