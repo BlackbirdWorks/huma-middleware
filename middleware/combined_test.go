@@ -20,6 +20,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	"github.com/blackbirdworks/huma-middleware/middleware/accesslog"
 	"github.com/blackbirdworks/huma-middleware/middleware/cleanpath"
 	"github.com/blackbirdworks/huma-middleware/middleware/compression"
 	"github.com/blackbirdworks/huma-middleware/middleware/logging"
@@ -51,8 +52,8 @@ func adapterBuilders() map[string]func() (http.Handler, huma.API) {
 	}
 }
 
-// TestAllTogether registers the recommended stack and checks that the layers agree on one request.
-func TestAllTogether(t *testing.T) {
+// TestCombined registers the recommended stack and checks that the layers agree on one request.
+func TestCombined(t *testing.T) {
 	t.Parallel()
 
 	builders := adapterBuilders()
@@ -90,6 +91,7 @@ func TestAllTogether(t *testing.T) {
 				api.UseMiddleware(
 					tracing.New(tracing.WithTracerProvider(tp), tracing.WithPropagators(propagation.TraceContext{})),
 					logging.New(logging.WithLogger(logger)),
+					accesslog.New(accesslog.WithLogger(logger)),
 					recovery.New(api),
 					compress,
 				)

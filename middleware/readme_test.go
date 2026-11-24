@@ -12,9 +12,9 @@ import (
 
 var readmeExample = regexp.MustCompile("(?s)<!-- example: (\\w+) (\\w+) -->\n```go\n(.*?)\n```")
 
-// TestReadmeSnippetsMirrorTheExamples checks that every README snippet is the text of an Example
+// TestReadme checks that every README snippet is the text of an Example
 // function of its package.
-func TestReadmeSnippetsMirrorTheExamples(t *testing.T) {
+func TestReadme(t *testing.T) {
 	t.Parallel()
 
 	readme, err := os.ReadFile("../README.md")
@@ -24,7 +24,8 @@ func TestReadmeSnippetsMirrorTheExamples(t *testing.T) {
 
 	wantPackages := map[string]bool{
 		"tracing":     false,
-		"logging":     false,
+		nameLogging:   false,
+		nameAccess:    false,
 		"recovery":    false,
 		"compression": false,
 		"cleanpath":   false,
